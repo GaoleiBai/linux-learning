@@ -1,0 +1,79 @@
+
+nandflash是一页一页的。一页是2048字节，每一页最后还跟着一个64字节的空间，称为oob；
+	为什么要引入oob呢？
+	答：因为nandflash有一个缺陷。去读写这一页没有问题，大部分情况下没问题，但是有很小几率会发生位反转
+		怎么解决这个位反转缺陷呢，于是引入oob
+		写：
+		①写一页数据
+		②生成ECC校验码
+		③ECC写oob里去
+		读：
+		①读页的数据
+		②读oob得到ECC
+		③然后读这页生成ECC
+		④进行比较
+
+校验码是怎么生成的呢？
+	每256个字节生成3个字节的ECC码，放入oob
+
+		
+Yaffs2文件
+	数据排位如下
+	|2048		|64	|
+	|2048		|64	|
+	|2048		|64	|
+	oob64字节，ECC位置如下，40-63；
+	第0位用来表示是否坏块0xff表明好，0x00表明坏
+	oobfree，意思就是oob数据部分用来放ECC之外，其他的可以给你使用；从2位置开始
+		static struct nand_oobinfo nand_oob_64 = {
+			.useecc = MTD_NANDECC_AUTOPLACE,
+			.eccbytes = 24,
+			.eccpos = {
+				40, 41, 42, 43, 44, 45, 46, 47, 
+				48, 49, 50, 51, 52, 53, 54, 55, 
+				56, 57, 58, 59, 60, 61, 62, 63},
+			.oobfree = { {2, 38} }
+		};
+	linux-3.4.2\drivers\mtd\nand\Nand_base.c：
+	static struct nand_ecclayout nand_oob_64 = {
+	.eccbytes = 24,
+	.eccpos = {
+		   40, 41, 42, 43, 44, 45, 46, 47,
+		   48, 49, 50, 51, 52, 53, 54, 55,
+		   56, 57, 58, 59, 60, 61, 62, 63},
+	.oobfree = {
+		{.offset = 2,
+		 .length = 38} }
+	};
+	分析：oobfree，给你使用的空间
+		  yaffs把它用作存一个yaffs_tag结构体
+
+怎么写？？？
+static int write_chunk(__u8 *data, __u32 objId, __u32 chunkId, __u32 nBytes)
+	//初始化一个结构体；
+	yaffs_ExtendedTags t;
+		//设置这个结构体；
+		t.xxx = xxx;	
+			yaffs_PackTags2(&pt,&t);											//Tags2结构体
+				memset(oob_buf, 0xff, sizeof(oob_buf));							//先把oob_buf这个初始化成全f
+				nand_prepare_oobbuf(oob_buf, (u_char *)&pt, &nand_oob_64);		//然后把pt复制到oob_buf里面来
+					for (i = 0; i < chunkSize/256; i++) {						//没256个字节生成3个校验码；
+						nand_calculate_ecc(data+i*256, ecc_code);				//用这个函数来生成校验码
+						oob_buf[nand_oob_64.eccpos[i*3]] = ecc_code[0];
+						oob_buf[nand_oob_64.eccpos[i*3]+1] = ecc_code[1];
+						oob_buf[nand_oob_64.eccpos[i*3]+2] = ecc_code[2];
+						
+至于怎么读，nandread涉及较深的源码。就不深究了。
+
+
+
+
+
+
+
+
+
+
+
+
+

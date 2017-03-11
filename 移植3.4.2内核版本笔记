@@ -1,0 +1,332 @@
+关键词：内核
+
+
+bootload：
+	①：把内核读入内存
+	②：设置TAG参数
+	③：启动
+		1、R0 = 0;
+		2、R1 = 机器ID
+		3、R2 = TAG参数地址
+
+内核：	根据R1，判断能否支持该机器，调用机器相关的初始化函数
+		解析TAG参数
+		装载驱动程序：网卡，FALASH
+		挂接根文件系统
+		启动应用程序
+		
+		
+一. 内核启动流程，据此配置内核(机器ID)
+1.1 修改Makefile
+	ARCH 			?= arm
+	CROSS_COMPILE 	?= arm-linux-
+	
+	find -name "*defconfig"	//找到defconfig相关文件
+	/arch/arm/configs 		//我们是arm架构，我们进入这个文件夹，就会出现一大堆配置文件
+	ls *2440*
+	ls *2410*				//发现了ls的新用法
+	
+	
+	
+1.2 选择默认配置 : make s3c2410_defconfig
+	生成.config
+		#
+		# configuration written to .config
+		#
+1.3 make uImage		
+		
+步骤1：
+在UBOOT里：
+set machid 16a   // smdk2440  mach-smdk2440.c
+或
+set machid 7CF   // mini2440  mach-mini2440.c
+	分析；设置机器ID
+	
+步骤2：
+arch\arm\mach-s3c24xx\mach-smdk2440.c
+s3c24xx_init_clocks(16934400);
+改为
+s3c24xx_init_clocks(12000000);
+	分析：修改晶振时钟；
+
+		
+步骤3：
+配置/编译: make s3c2410_defconfig 或 make mini2440_defconfig
+			分析：s3c2410_defconfig这个配置的话支持的单板非常多，如果 make mini2440_defconfig的话只支持mini2440
+           make uImage
+				
+步骤4：
+在uboot里：set bootargs console=ttySAC0,115200 .....	
+	分析：在u-boot里面必须指定波特率，否则的话就会乱码；
+	
+	
+uboot的默认MACH ID：
+
+Bootm.c(arch\arm\lib)
+s= getenv("machid"):
+	从环境变量中得到machineID
+	如果s = getenv("machid");成功，则使用它；
+	如果没有的话就使用下面的默认值
+Smdk2410.c(board\samsung\smdk2440):
+gd->bd->bi_arch_number = MACH_TYPE_SMDK2410;  // 193
+
+u-boot传入的值R1，通过
+
+vi ./arch/arm/include/asm/mach-types.h
+vi include/generated/mach-types.h				//generated 这些文件应该是临时生成的、
+	里面就有 	
+	#define MACH_TYPE S3C2440	362
+	这个是u-boot传入的R1的值(也就是上面的362)然后找到这个结构体，调用里面的s3c244x_restart这个初始化函数
+		MACHINE_START(S3C2440, "SMDK2440")
+			/* Maintainer: Ben Dooks <ben-linux@fluff.org> */
+			.atag_offset	= 0x100,
+
+			.init_irq	= s3c24xx_init_irq,
+			.map_io		= smdk2440_map_io,
+			.init_machine	= smdk2440_machine_init,
+			.timer		= &s3c24xx_timer,
+			.restart	= s3c244x_restart,
+		MACHINE_END
+
+set machid 16a   // smdk2440  mach-smdk2440.c
+set machid 7CF   // mini2440  mach-mini2440.c
+
+nfs 32000000 192.168.1.103:/work/nfs_root/uImage_new
+bootm 32000000		
+		
+		
+grep "\"Boot\ Agent\"" * -nR
+	arch/arm/mach-s3c24xx/common-smdk.c:113:	.nmae	=	"Boot Agent",
+	
+二. 修改分区, 制作新的文件系统
+
+
+nfs 30000000 192.168.1.103:/work/nfs_root/fs_mini_mdev.yaffs2
+nand erase.part rootfs
+nand write.yaffs 30000000 260000  889bc0
+
+nfs 30000000 192.168.1.103:/work/nfs_root/fs_mini_mdev.jffs2
+nand erase.part rootfs
+nand write.jffs2 30000000 260000  $(filesize
+	分析：$filesize这个表示下载文件的大小；新版本不用括号
+	尝试过了&(filesize这样可以
+set bootargs console=ttySAC0,115200 root=/dev/mtdblock3 rootfstype=jffs2
+
+制作文件系统
+1. 交叉编译busybox
+	 tar xjf busybox-1.20.0.tar.bz2  
+	 cd busybox-1.20.0/
+	 make menuconfig
+	 make
+	
+	安装：make install CONFIG_PREFIX=/work/nfs_root/fs_mini_mdev_new
+	
+	echo $PATH
+	/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/arm/4.3.2/bin
+	查看之后得交叉编译的目录在/usr/local/arm/4.3.2/bin
+	于是进入:cd /usr/local/arm/4.3.2/bin
+	搜索有关的lib文件
+		find -name lib
+		./arm-none-linux-gnueabi/libc/thumb2/lib
+		./arm-none-linux-gnueabi/libc/thumb2/usr/lib
+		./arm-none-linux-gnueabi/libc/armv4t/lib
+		./arm-none-linux-gnueabi/libc/armv4t/usr/lib
+		./arm-none-linux-gnueabi/libc/lib
+		./arm-none-linux-gnueabi/libc/usr/lib
+		./arm-none-linux-gnueabi/lib
+		./lib
+	主要选择./arm-none-linux-gnueabi/libc/armv4t/lib
+			./arm-none-linux-gnueabi/libc/armv4t/usr/lib
+	
+
+
+2. 安装库
+	mkdir /work/nfs_root/fs_mini_mdev_new/lib
+	mkdir /work/nfs_root/fs_mini_mdev_new/usr/lib -p
+
+	cp /usr/local/arm/4.3.2/arm-none-linux-gnueabi/libc/armv4t/lib/*so*  /work/nfs_root/fs_mini_mdev_new/lib -d
+		分析： 加上-d选项，意思就是原来它这链接你拷贝过来，也把它当成链接文件，否则的话就会当成实际文件，到时文件系统非常庞大
+		
+	cp /usr/local/arm/4.3.2/arm-none-linux-gnueabi/libc/armv4t/usr/lib/*so*  /work/nfs_root/fs_mini_mdev_new/usr/lib -d
+
+3. 构建etc目录
+	fs_mini_mdev_new/etc$ ls
+		fstab  init.d  inittab
+		
+	
+	inittab：
+	# /etc/inittab
+	::sysinit:/etc/init.d/rcS
+	s3c2410_serial0::askfirst:-/bin/sh
+	::ctrlaltdel:/sbin/reboot
+	::shutdown:/bin/umount -a -r
+	分析：
+	::sysinit:/etc/init.d/rcS
+		先执行这个脚本
+	s3c2410_serial0::askfirst:-/bin/sh
+		执行完上面那个脚本之后启动sh，sh从哪里得到输入呢？从s3c2410_serial0这个设备得到输入	
+		s3c2410_serial0::askfirst:-/bin/sh改成console::askfirst:-/bin/sh
+		console对应什么设备呢？
+			set bootargs console=ttySAC0,115200 root=/dev/mtdblock3 rootfstype=jffs2
+			对应的事ttySAC0，也就是第0个串口
+		
+		vi	init.d/rcS
+			#!/bin/sh
+			ifconfig eth0 192.168.1.17
+
+			mount -a
+			mkdir /dev/pts
+			mount -t devpts devpts /dev/pts
+			echo /sbin/mdev > /proc/sys/kernel/hotplug
+			mdev -s
+		
+		分析：mount -a根据fstab这个文件的内容来挂接各种根文件系统
+		cat fstab 
+		# device     mount-point    type   options        dump  fsck order
+		proc           /proc        proc   defaults        0     0
+		tmpfs          /tmp         tmpfs  defaults        0     0
+		sysfs          /sys         sysfs  defaults        0     0
+		tmpfs          /dev         tmpfs  defaults        0     0
+		
+
+
+4. 构建dev目录，在fs_mini_mdev_new目录下
+
+ls -l /dev/console /dev/null 
+crw------- 1 root root 5, 1 2017-03-06 23:01 /dev/console
+crw-rw-rw- 1 root root 1, 3 2017-03-06 22:31 /dev/null
+
+在dev目录下，创建console和null
+sudo mknod dev/console c 5 1
+
+sudo mknod dev/null c 1 3
+
+
+5. 其他空目录 
+
+mkdir proc tmp mnt sys root
+
+------
+
+mkfs.jffs2 -n -s 2048 -e 128KiB -d fs_mini_mdev_new -o fs_mini_mdev_new.jffs2 
+	分析：-s是扇区的大小，nandflash一个扇区的大小是2048，
+		  -e是可擦除块，128KiB
+		  -d是目录
+		  -o是输出文件
+
+
+烧写：
+nfs 30000000 192.168.1.103:/work/nfs_root/fs_mini_mdev_new.jffs2
+nand erase.part rootfs
+nand write.jffs2 30000000 260000  $filesize
+set bootargs console=ttySAC0,115200 root=/dev/mtdblock3 rootfstype=jffs2 
+nfs 32000000 192.168.1.103:/work/nfs_root/uImage_new
+bootm 32000000
+
+SIGILL   illegal instruction
+6. 重新配置内核支持EABI
+set bootargs console=ttySAC0,115200 root=/dev/mtdblock3 rootfstype=jffs2 
+nfs 32000000 192.168.1.103:/work/nfs_root/uImage_eabi
+bootm 32000000
+
+
+
+
+三. 移植YAFFS文件系统/YAFFS文件系统是专门为nandflash而制定的
+
+1. 获得源码
+	如果系统没有装git命令的话：sudo apt-install git
+	git clone git://www.aleph1.co.uk/yaffs2 
+
+2. 打补丁
+	cd yaffs-dir
+	./patch-ker.sh  c m linux-tree   
+	比如 ./patch-ker.sh c m /work/system/linux-3.4.2
+
+3. 配置内核支持YAFFS
+	/work/system/linux-3.4.2
+	make menuconfig
+	|   Location:                                                                                            |
+	|     -> File systems                                                                                    |
+	|       -> Miscellaneous filesystems (MISC_FILESYSTEMS [=y])                                             |
+	|         -> yaffs2 file system support (YAFFS_FS [=y]) 		//	选择Y                                |
+	|           -> 512 byte / page devices (YAFFS_YAFFS1 [=y])                                               |
+	|             -> Use older-style on-NAND data format with pageStatus byte (YAFFS_9BYTE_TAGS [=n])
+	
+
+4. 编译、使用uImage
+	make uImage
+
+5. 制作、烧写yaffs映象
+	mkyaffs2image fs_mini_mdev_new fs_mini_mdev_new.yaffs2
+	uboot:
+	nfs 30000000 192.168.1.103:/work/nfs_root/fs_mini_mdev_new.yaffs2
+	nand erase.part rootfs
+	nand write.yaffs 30000000 260000  $filesize
+
+6. 启动
+	set bootargs console=ttySAC0,115200 root=/dev/mtdblock3
+	nfs 32000000 192.168.1.103:/work/nfs_root/uImage_yaffs
+	bootm 32000000
+
+7. 没成功，用替代法查找问题
+	7.1 UBOOT可能有问题：换上1.1.6的UBOOT
+	tftp 30000000 u-boot.bin
+	nand erase.part u-boot
+	nand write 30000000 u-boot
+	reset
+	nfs 30000000 192.168.1.103:/work/nfs_root/fs_mini_mdev_new.yaffs2
+	nand erase rootfs
+	nand write.yaffs 30000000 260000  $(filesize)
+	set bootargs console=ttySAC0,115200 root=/dev/mtdblock3
+	nfs 32000000 192.168.1.103:/work/nfs_root/uImage_yaffs
+	bootm 32000000
+
+发现1.1.6的UBOOT没问题，所以就是我们移植的新UBOOT有BUG：
+	drivers\mtd\nand\Nand_util.c
+
+		if (!need_skip && !(flags & WITH_DROP_FFS)) {
+	改为
+		if (!need_skip && !(flags & WITH_DROP_FFS) && !(flags & WITH_YAFFS_OOB)) {
+
+
+7.2 YAFFS映象可能有问题
+
+
+	制作了u-boot_new.bin, uImage_new, fs_mini_mdev_new.yaffs
+	重烧整个系统：
+	使用jtag工具烧u-boot_new.bin
+	或使用uboot来更新自己: tftp 30000000 u-boot_new.bin; nand erase.part u-boot; nand write 30000000 u-boot
+	启动uboot，用它来烧写内核、FS
+	tftp 30000000 uImage_new; nand erase.part kernel; nand write 30000000 kernel
+	tftp 30000000 fs_mini_mdev_new.yaffs2; nand erase.part rootfs; nand write.yaffs 30000000 260000  $filesize
+
+	设置参数
+	set 'nand read 30000000 kernel;bootm 30000000'
+	set bootargs console=ttySAC0,115200 root=/dev/mtdblock3
+	set machid 16a
+	save
+
+
+	使用内核补丁：
+	patch -p1 < ../linux-3.4.2_100ask.patch 
+	cp config_ok .config
+	make uImage
+
+生成补丁：
+different -urN linux-3.4.2 linux-3.4.2_100ask > linux-3.4.2_100ask.patch
+
+
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		

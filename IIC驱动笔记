@@ -1,0 +1,383 @@
+IIC
+
+关键字：
+①：    App ：open read write
+    -------------------------------------
+     驱动：drv_open drv_read drv_write  		 I2C设备设备驱动程序：直道数据含义
+          -------------------------------
+            I2C总线驱动程序       				 ①：设备 ②：提供读写函数：知道如何收发
+    -------------------------------------
+    硬件： AT24C02/AT24C08
+    总线：drives/i2c/busses
+    各种设备相关的东西：驱动：drv_open drv_read drv_write在这个drives/i2c/chip目录下
+②：所有的I2C设备都在sysfs文件系统的/sys/bus/i2c目录下
+    在linux内核源代码中的drivers目录下有一个i2c目录，而在i2c目录下又包含如下文件和文件夹
+        ①：i2c-core.c 
+            这个文件实现了i2c核心的功能以及/proc/bus/i2c接口
+        ②：i2-dev.c
+            提供open read write等文件操作接口实现了 I2C 适配器设备文件的功能，每一个 I2C 适配器都被分配一个设备。通过适配器访问
+            设备时的主设备号都为 89，次设备号为 0～255。应用程序通过“ i2c-%d” （ i2c-0, i2c-1,…, i2c-10,…）文件名并使用文件
+            操作接口 open()、 write()、 read()、 ioctl()和 close()等来访问这个设备。i2c-dev.c 并没有针对特定的设备而设计，只是
+            提供了通用的 read()、 write()和 ioctl()等接口，应用层可以借用这些接口访问挂接在适配器上的 I2C 设备的存储空间或寄存
+            器，并控制 I2C 设备的工作方式。
+        ③：busses文件夹
+            这个文件包含一些i2c主机控制器的驱动，如i2c-tegra.c i2c-s3c2410.c等。这个文件中包含了一些 I2C 总线的驱动，如针对
+            S3C2410、 S3C2440 和 S3C6410 等处理器的I2C 控制器驱动为 i2c-s3c2410.c。
+        ④：algos文件夹
+            实现了一些i2c总线设备期的通信方法
+        ⑤：chips目录
+            这个目录中包含了一些特定的 I2C 设备驱动，如 Dallas 公司的 DS1337 实时钟芯片、 EPSON
+            公司的 RTC8564 实时钟芯片和 I2C 接口的 EEPROM 驱动等。
+            在具体的 I2C 设备驱动中，调用的都是 I2C 核心提供的 API，因此，这使得具体的 I2C 设备驱
+            动不依赖于 CPU 的类型和 I2C 适配器的硬件特性。
+----------------------------------------------------------------------------------------------------
+框架分析：！！！！！！！！！！！！！！！！！！！！
+①：（左边）适配器，即是插槽锁应该做的事情--向上i2c_bus_type即是bus总线注册，通过I2c_add_adpter这个函数
+I2C总线驱动程序：
+	Ⅰ、分配I2c_adapter
+	Ⅱ、设置--即是怎么收发信号，怎么发出起始信号，怎么发出终止信号，怎么发出响应信号，怎么发出数据之类的。
+static struct s3c24xx_i2c s3c24xx_i2c = 
+	.adap = {
+		.algo = &s3c24xx_i2c_algorithm,							//算法函数
+			static const struct i2c_algorithm s3c24xx_i2c_algorithm = {
+				.functionality		= s3c24xx_i2c_func,
+				.master_xfer = s3c24xx_i2c_xfer,				//发出I2c信号的函数
+					s3c24xx_i2c_enable_irq(i2c);				//i2c中断函数
+					s3c24xx_i2c_message_start(i2c, msgs);		//启动传输函数，里面大部分的工作就是设置寄存器之类的
+							iiccon = readl(i2c->regs + S3C2410_IICCON);				//设置i2c控制寄存器
+							writel(stat, i2c->regs + S3C2410_IICSTAT);				//设置i2c状态寄存器
+							dev_dbg(i2c->dev, "START: %08lx to IICSTAT, %02x to DS\n", stat, addr);
+							writeb(addr, i2c->regs + S3C2410_IICDS);				//设置i2cDS寄存器
+					spin_unlock_irq(&i2c->lock);
+
+	Ⅲ、注册I2c_add_adapter
+	I2c_add_adapter函数的主要内容！！！：：：
+		①、放入链表
+		②、调用drv的attach_adapter。attach_adapter：添加到适配器上的一个函数，里面放有什么东西：
+		里面放有i2c_probe函数，它永远是这一个格式！
+		static int eeprom_attach_adapter(struct i2c_adapter *adapter)
+			return i2c_probe(adapter, &addr_data, eeprom_detect);	
+例：19th_i2c_drv\5th\at24cxx.c
+static int at24cxx_attach(struct i2c_adapter *adapter)
+{
+	return i2c_probe(adapter, &addr_data, at24cxx_detect);		//at24cxx_detect即是function函数
+}
+对应的detach函数如下
+static int at24cxx_detach(struct i2c_client *client)
+{
+	printk("at24cxx_detach\n");
+	class_device_destroy(cls, MKDEV(major, 0));
+	class_destroy(cls);
+	unregister_chrdev(major, "at24cxx");
+
+	i2c_detach_client(client);
+	kfree(i2c_get_clientdata(client));
+
+	return 0;
+}
+		③、i2c_probe(adapter,设备地址，function)
+			①用adapter的master_xfer发信号，确定有无该设备
+			②若有，则调用函数中的function
+		④、构造i2c_client
+			.address			//该设备地址匹配 设备驱动中	i2c_probe中的i2c_probe.address
+			.adapter
+			.driver				//该driver匹配 设备驱动中 i2c_drvie中的i2c_drvier.id
+例：19th_i2c_drv\5th\at24cxx	
+
+static unsigned short ignore[]      = { I2C_CLIENT_END };
+static unsigned short normal_addr[] = { 0x50, I2C_CLIENT_END }; /* 地址值是7位 */
+											/* 改为0x60的话, 由于不存在设备地址为0x60的设备, 所以at24cxx_detect不被调用
+												但是加了forces这个强制函数之后又不一样了*/
+static unsigned short force_addr[] = {ANY_I2C_BUS, 0x60, I2C_CLIENT_END};		//第一个值ANY_I2C_BUS是适用的总线。在哪一个总线上查找，在哪个总线寻找这个设备，第二个是设备地址，第三个退出来。
+static unsigned short * forces[] = {force_addr, NULL};
+										
+static struct i2c_client_address_data addr_data = {
+	.normal_i2c	= normal_addr, 		 /* 要发出S信号和设备地址并得到ACK信号,才能确定存在这个设备 */
+	.probe		= ignore,
+	.ignore		= ignore,
+	//.forces     = forces,			 /* 强制认为存在这个设备 */
+};
+static int at24cxx_detect(struct i2c_adapter *adapter, int address, int kind)//这个函数即是function，我们可以看看韦东山在写这个at24xx函数具体需要实现什么功能，具体如下
+{																							
+	printk("at24cxx_detect\n");、
+	/* 构构一个i2c_client结构体: 以后收改数据时会用到它 */					//那么这个at24cxx_detect函数被谁调用呢？？？
+	at24cxx_client = kzalloc(sizeof(struct i2c_client), GFP_KERNEL);		//答：在这个at24cxx_driver中at24cxx_attach函数中的i2c_probe函数被调用到，at24cxx_driver它里面有两个函数
+	at24cxx_client->addr    = address;										  分别是.attach_adapter = at24cxx_attach,																						
+	at24cxx_client->adapter = adapter;											    .detach_client  = at24cxx_detach,
+	at24cxx_client->driver  = &at24cxx_driver;								  			①.attach_adapter = at24cxx_attach,就是用来连接相关设备的，它里面定义了
+	strcpy(at24cxx_client->name, "at24cxx");												static int at24cxx_attach(struct i2c_adapter *adapter)													    
+	i2c_attach_client(at24cxx_client);															return i2c_probe(adapter, &addr_data, at24cxx_detect);
+																						//你看，at24cxx_detect函数被调用的过程就是这样
+	major = register_chrdev(0, "at24cxx", &at24cxx_fops);								②而.detach_client  = at24cxx_detach,却是跟attach相反方向操作，相当于各种卸载
+
+	cls = class_create(THIS_MODULE, "at24cxx");
+	class_device_create(cls, NULL, MKDEV(major, 0), NULL, "at24cxx"); /* /dev/at24cxx */
+	
+	return 0;
+}
+	解析i2c_driver 与 i2c_client的关系
+    i2c_driver 对应一套驱动方法，其主要成员函数是 probe()、 remove()、 suspend()、 resume()等，
+    另外 id_table 是该驱动所支持的 I2C 设备的 ID 表。 i2c_client 对应于真实的物理设备，每个 I2C 设
+    备都需要一个 i2c_client 来描述。 i2c_driver 与 i2c_client 的关系是一对多，一个 i2c_driver 上可以
+    支持多个同等类型的 i2c_client。
+------------------------------------------------------------
+②（右边）设备驱动：drv--向上i2c_bus_type即是bus总线注册I2c_add_driver
+	Ⅰ、i2c_drvier
+		.id
+		.attach_adapter：添加到适配器上的一个函数
+	Ⅱ、I2c_add_driver：
+		1、把I2c_driver放入链表
+		2、从adapter链表中取出“适配器”，调用drv的attach_adapter
+			attach_adapter这个函数会调用i2c_probe
+		3、i2c_probe(adapter,设备地址，function)				//该地址与设备器中i2c_client.address一样
+			①用adapter的master_xfer发信号，确定有无该设备，这个“设备”指的就是i2c_probe函数中相对于的设备地址的那个硬件设备！
+			②若有，则调用函数中的function
+i2c_add_driver
+	i2c_register_driver		//注册
+		driver->driver.bus = &i2c_bus_type;			//确定该总线是i2c总线
+		driver_register(&driver->driver);			//注册一个driver
+		
+		list_for_each_entry(adapter, &adapters, list) {
+			driver->attach_adapter(adapter);					
+		分析：对于adapters适配器链表里面的每一个成员，调用driver里的attach_adapter函数。
+						i2c_probe(adapter, &addr_data, eeprom_detect);
+							i2c_probe_address			 // 发出S信号,发出设备地址(来自addr_data)
+								i2c_smbus_xfer
+									i2c_smbus_xfer_emulated
+										i2c_transfer
+											adap->algo->master_xfer // s3c24xx_i2c_xfer
+-----------------------------------------------------------------------
+小结：
+不管是先注册adapter还是先注册driver函数
+最终会导致他们调用I2C_driver.attach_adapter函数中的i2c_probe函数
+i2c_probe里面有adpater，这个adpater设配器里面有.master_xfer = s3c24xx_i2c_xfer ，i2c传输函数
+里面还有一个设备地址，和function功能函数
+假如收到响应函数的话，就调用function功能函数。在里面可以注册字符设备，注册块设备，做任何事情。
+-----------------------------------------------------------------------
+少杰笔记：
+①：根据Linux的官方文档《linux-3.4.2\Documentation\i2c\instantiating-devices》，添加i2c设备的方法总结有4种：
+	1. i2c_register_board_info：根据总线编号、设备名字（“at24c08”）、设备地址（0x50）注册一个字符驱动。这种方法最简单、
+		最粗暴，最贴近平时在开片机上开发i2c器件的。
+	2. i2c_new_device：根据i2c总线的编号，声明一个i2c设备：这种方法就是上面例子用的方法。这种方法也简单，但是需要事先知
+		道器件挂接在哪条总线上。对于设备，还实现知道了设备地址0x50，总线适配器也支持名字为“at24c08”的设备
+---------------------------------------------------------------------------
+各个程序驱动详解：
+①：设备层：i2c_driver i2c_client
+    总线层：i2c_algorithm i2c_adapter
+②：i2c设备：i2c_client的内核代码    
+    struct i2c_client 
+	{
+	unsigned short flags;				/* div., see below		*/
+	unsigned short addr;				/* chip address - NOTE: 7bit	*/七位地址
+										/* addresses are stored in the	*/
+										/* _LOWER_ 7 bits		*/
+	char name[I2C_NAME_SIZE];   		//设备名称，最大为20字节
+	struct i2c_adapter *adapter;		/* the adapter we sit on	*/
+	struct i2c_driver *driver;			/* and our access routines	*/
+	int usage_count;					/* How many accesses currently  */
+										/* to the client		*/
+	struct device dev;					/* the device structure		*/
+	int irq;							/* irq issued by device (or -1) */
+	char driver_name[KOBJ_NAME_LEN];
+	struct list_head list;        		//连接到总线上的所有设备
+	struct completion released;         //是否已经释放的完成量
+};
+	
+③：参考eeprom.c(drivers/i2c/chips)
+    struct i2c_driver {
+	int id;            								 //驱动标识ID   I2C_DRIVERID_EEPROM
+	unsigned int class;  							 //驱动的类型
+	int (*attach_adapter)(struct i2c_adapter *);     //当检测到适配器时调用的函数
+	int (*detach_adapter)(struct i2c_adapter *);     //卸载适配器时调用的函数
+	int (*detach_client)(struct i2c_client *);       //卸载设备的时候调用的函数
+
+
+	int (*probe)(struct i2c_client *);  //新类型设备的探测函数
+	int (*remove)(struct i2c_client *); //新类型设备的移除函数
+
+	void (*shutdown)(struct i2c_client *);  //关闭i2c设备
+	int (*suspend)(struct i2c_client *, pm_message_t mesg); //挂起i2c设备
+	int (*resume)(struct i2c_client *); //恢复i2c设备
+
+
+	int (*command)(struct i2c_client *client,unsigned int cmd, void *arg);  //类似于字符设备的ioctl()函数，用来控制设备的状态
+
+	struct device_driver driver;    //设备驱动接口体
+	struct list_head list;  
+};
+④：at24cxx_write，at24cxx的读函数
+	static ssize_t at24cxx_write(struct file *file, const char __user *buf, size_t size, loff_t *offset)
+	{
+		unsigned char val[2];
+		struct i2c_msg msg[1];					
+		int ret;
+		
+		/* address = buf[0] 
+		 * data    = buf[1]
+		 */
+		if (size != 2)
+			return -EINVAL;
+		
+		copy_from_user(val, buf, 2);
+
+		/* 数据传输三要素: 源,目的,长度 */
+		msg[0].addr  = at24cxx_client->addr;  /* 目的 */
+		msg[0].buf   = val;                   /* 源 */
+		msg[0].len   = 2;                     /* 地址+数据=2 byte */
+		msg[0].flags = 0;                     /* 表示写 */
+
+		ret = i2c_transfer(at24cxx_client->adapter, msg, 1);
+		if (ret == 1)
+			return 2;
+		else
+			return -EIO;
+	}
+	分析：i2c_transfer(at24cxx_client->adapter, msg, 1);i2c传输需要什么参数：
+				1、adapter（因为要用到适配器里面的传输函数进行传输）而at24cxx_client里面有适配器。
+				2、msg：i2c消息，我们要构造这个i2c消息												 
+					struct i2c_msg msg[1];
+					/* 数据传输三要素: 源,目的,长度 */
+					msg[0].addr  = at24cxx_client->addr;  /* 目的 */				设备地址等于at24cxx_client->addr;
+					msg[0].buf   = val;                   /* 源 */				
+					msg[0].len   = 2;                     /* 地址+数据=2 byte */	第一个数据是表明地址address = buf[0] 第二个是数据data = buf[1]
+					msg[0].flags = 0;                     /* 表示写 */				0表示写
+				3、int num韦定义为1，就是一个消息	
+		return 2;：表明成功，系统内核定义
+
+⑤：at24cxx_read，at24cxx的读函数
+static ssize_t at24cxx_read(struct file *file, char __user *buf, size_t size, loff_t * offset)
+{
+	unsigned char address;
+	unsigned char data;
+	struct i2c_msg msg[2];
+	int ret;
+	
+	/* address = buf[0] 
+	 * data    = buf[1]
+	 */
+	if (size != 1)
+		return -EINVAL;
+	
+	copy_from_user(&address, buf, 1);
+
+	/* 数据传输三要素: 源,目的,长度 */
+
+	/* 读AT24CXX时,要先把要读的存储空间的地址发给它 */
+	msg[0].addr  = at24cxx_client->addr;  /* 目的 */
+	msg[0].buf   = &address;              /* 源 */
+	msg[0].len   = 1;                     /* 地址=1 byte */
+	msg[0].flags = 0;                     /* 表示写 */
+
+	/* 然后启动读操作 */
+	msg[1].addr  = at24cxx_client->addr;  /* 源 */
+	msg[1].buf   = &data;                 /* 目的 */
+	msg[1].len   = 1;                     /* 数据=1 byte */
+	msg[1].flags = I2C_M_RD;              /* 表示读 */
+
+
+	ret = i2c_transfer(at24cxx_client->adapter, msg, 2);
+	if (ret == 2)
+	{
+		copy_to_user(buf, &data, 1);
+		return 1;
+	}
+	else
+		return -EIO;
+}
+	分析：i2c的读的时候要有两个操作，第一个操作是把这个地址写给设备，第二个操作是从这个设备里面读数据
+⑥：参考19th_i2c_drv\5th\i2c_test.c。这个是i2c的测试程序
+void print_usage(char *file)
+{
+	printf("%s r addr\n", file);
+	printf("%s w addr val\n", file);
+}
+
+int main(int argc, char **argv)
+{
+	int fd;
+	unsigned char buf[2];
+	
+	if ((argc != 3) && (argc != 4))
+	{
+		print_usage(argv[0]);
+		return -1;
+	}
+
+	fd = open("/dev/at24cxx", O_RDWR);
+	if (fd < 0)
+	{
+		printf("can't open /dev/at24cxx\n");
+		return -1;
+	}
+
+	if (strcmp(argv[1], "r") == 0)
+	{
+		buf[0] = strtoul(argv[2], NULL, 0);
+		read(fd, buf, 1);
+		printf("data: %c, %d, 0x%2x\n", buf[0], buf[0], buf[0]);
+	}
+	else if (strcmp(argv[1], "w") == 0)
+	{
+		buf[0] = strtoul(argv[2], NULL, 0);
+		buf[1] = strtoul(argv[3], NULL, 0);
+		write(fd, buf, 2);
+	}
+	else
+	{
+		print_usage(argv[0]);
+		return -1;
+	}
+	
+	return 0;
+}
+	分析：
+	①  int main(int argc, char **argv)
+		main是应用程序和操作系统之间约定好的一个接口名
+		解释一：
+		argc是命令行总的参数个数   
+		argv[]是argc个参数，其中第0个参数是程序的全名（包括文件绝对路径），以后的参数命令行后面跟的用户输入的参数
+		解释二：
+		在Linux下，argc可以看做是传递给Shell解释器的命令行参数个数，包括程序名本身。argv是个二级指针，或者认为是指针数组。总而言之：动态参数而已
+		char **argv 就好理解了，它就是一个指向字符串的指针。 当你在终端打入 Leds led_no 0 时，argv[0]就是Leds，argv[1]就是led_no, argv[2]就是 0; 
+	①	fd = open("/dev/at24cxx", O_RDWR);
+		O_RDWR 表示read write 是可读可写的意思
+		这句返回一个文件描述符，成功返回大于等于0的数，出错返回-1
+	②  strcmp 函数是个编辑函数，主要作用就是比较两个字符串
+			设这两个字符串为str1，str2，
+			若str1==str2，则返回零；
+			若str1<str2，则返回负数；
+			若str1>str2，则返回正数。
+			if (strcmp(argv[1], "r") == 0)的意思就是argv[1]==“r”；(strcmp(argv[1], "w") == 0)相同意思
+	③	strtoul函数
+		unsigned long strtoul(const char *nptr,char **endptr,int base )
+			参数1：字符串起始地址
+			参数2：返回字符串有效数字的结束地址，这也是为什么要用二级指针的原因。
+			参数3：转换基数。当base=0,自动判断字符串的类型，并按10进制输出，例如"0xa",就会把字符串当做16进制处理，输出的为10。
+		
+--------------------------------------------------------------------------------------------------------------------		
+怎么写I2C设备驱动程序？
+1. 分配一个i2c_driver结构体
+2. 设置
+      attach_adapter // 它直接调用 i2c_probe(adap, 设备地址, 发现这个设备后要调用的函数（function）);
+      detach_client  // 卸载这个驱动后,如果之前发现能够支持的设备,则调用它来清理
+/* 1. 分配一个i2c_driver结构体 */
+/* 2. 设置i2c_driver结构体 */
+	static struct i2c_driver at24cxx_driver = {
+		.driver = {
+			.name	= "at24cxx",
+		},
+		.attach_adapter = at24cxx_attach,
+		.detach_client  = at24cxx_detach,
+	};
+3. 注册：i2c_add_driver
+	static int at24cxx_init(void)
+		i2c_add_driver(&at24cxx_driver);
+
+
+
+
+测试1th:
+1. insmod at24cxx.ko
+   观察输出信息
+2. 修改normal_addr里的0x50为0x60
+   编译加载，观察输出信息

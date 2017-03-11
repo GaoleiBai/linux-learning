@@ -1,0 +1,321 @@
+关键词：LCD,LCD框架,dmesg命令
+LCD驱动程序
+fbmem.c只是一个抽象出来的框架程序，他并不能作为驱动程序，还要依赖于底层的驱动程序，给它注册一个fb结构体
+假设
+app:  open("/dev/fb0", ...)   主设备号: 29, 次设备号: 0
+--------------------------------------------------------------
+kernel:
+         fb_open：
+         	int fbidx = iminor(inode);			//得到这个设备节点的次设备号
+         	struct fb_info *info;				
+			if (!(info = registered_fb[fbidx]))		//在这个数组里面得到以次设备号为下标的一项
+						return -ENODEV;
+			if (info->fbops->fb_open)
+			{
+				res = info->fbops->fb_open(info,1);
+			if (res)
+				module_put(info->fbops->owner);
+			}
+		分析：
+		fb：Frame Buffer的本意帧缓冲。它是指显示设备里的显存。显存里保存是像素的RGB数据。一个显存的大小，屏幕宽度*屏幕高度*每像素字节数。
+		软件修改显存的像素值，就形成各种显示效果.再由硬件将显存数据送到显示模块输出。显存一般是由SDRAM一段连续的空间来充当。
+		Linux一般都把FB设备当成显示设备标准接口。它的设备结点 /dev/fbn表示。比如第一个FB设备是/dev/fb0.应用程序通过一组标准IOCTL来操作FB驱动。
+app:  read()
+---------------------------------------------------------------
+kernel:
+		fb_read
+			int fbidx = iminor(inode);						//以次设备号为下标	
+			struct fb_info *info = registered_fb[fbidx];	//在这个数组里面得到一项
+			if (info->fbops->fb_read)						//如果这个数组项里面提供了fbops，就调用它的读函数
+				return info->fbops->fb_read(info, buf, count, ppos);
+         	//如果没有提供fops的话就读这些数据
+			src = (u32 __iomem *) (info->screen_base + p);	//info结构体由registered_fb中来的，screen_base就是显存！
+			dst = buffer;
+			*dst++ = fb_readl(src++);
+			copy_to_user(buf, buffer, c)         	
+
+问1. registered_fb在哪里被设置？
+答1. register_framebuffer
+	即是硬件相关的驱动程序向fbmem.c注册register_framebuffer.
+	register_framebuffer被谁调用呢：各种各样的LCD程序，例如s3c2410fb.c
+	femem.c是上层，其中包含了主设备号，file_operations,register_chardev;	
+	
+------------------------------------------------------------------
+
+怎么写LCD驱动程序？
+例：
+1. 分配一个fb_info结构体: framebuffer_alloc
+		static struct fb_info *s3c_lcd;
+			s3c_lcd = framebuffer_alloc(0, NULL);
+2. 设置
+	2.1 设置固定的参数
+		s3c_lcd->fix.
+	2.2 设置可变的参数
+		s3c_lcd->var.
+	2.3 设置操作函数 
+		s3c_lcd->fbops = &s3c_lcdfb_ops;
+    2.4 其他的设置 
+		s3c_lcd->pseudo_palette = pseudo_palette;
+		//s3c_lcd->screen_base  = ; 			 /* 显存的虚拟地址 */ 
+		s3c_lcd->screen_size   = 480*272*16/8;	/* 显存的大小*/ 
+3. 硬件相关的操作:
+	①根据LCD手册，设置LCD控制器
+	3.1 配置GPIO用于LCD 
+		gpbcon = ioremap(0x56000010, 8);
+		gpbdat = gpbcon+1;						//指针加1相当于加4
+		gpccon = ioremap(0x56000020, 4);		//写4或者是1024都没关系，它都会帮你一页一页的映射的，不会只给你映射4个字节
+		gpdcon = ioremap(0x56000030, 4);
+		gpgcon = ioremap(0x56000060, 4);
+
+		*gpccon  = 0xaaaaaaaa;   /* GPIO管脚用于VD[7:0],LCDVF[2:0],VM,VFRAME,VLINE,VCLK,LEND */
+		*gpdcon  = 0xaaaaaaaa;   /* GPIO管脚用于VD[23:8] */
+		 
+		*gpbcon &= ~(3);  /* GPB0设置为输出引脚 */
+		*gpbcon |= 1;		//先不要开启背光
+		*gpbdat &= ~1;     /*开启背光： 输出低电平 */
+ 
+		*gpgcon |= (3<<8); /* GPG4用作LCD_PWREN -电源*/
+	②分配显存，并把地址告诉LCD控制器
+	/* 3.2 根据LCD手册设置LCD控制器，比如VCLK的频率等*/
+		lcd_regs = ioremap(0x4D000000, sizeof(struct lcd_regs));
+	/* bit[17:8]: VCLK = HCLK / [(CLKVAL+1) x 2], LCDÊÖ²áP14
+	 *            10MHz(100ns) = 100MHz / [(CLKVAL+1) x 2]
+	 *            CLKVAL = 4
+	 * bit[6:5]: 0b11, TFT LCD
+	 * bit[4:1]: 0b1100, 16 bpp for TFT
+	 * bit[0]  : 0 = Disable the video output and the LCD control signal.
+	 */
+		lcd_regs->lcdcon1  = (4<<8) | (3<<5) | (0x0c<<1);
+#if 1
+	/*垂直方向的时间函数
+	 * bit[31:24]: VBPD, VSYNC之后再过多长时间才能发出第一行数据
+	 *             LCD手册	T0-T2-T1=4
+	 *             VBPD=3
+	 * bit[23:14]: 多少行, 320, 所以：LINEVAL=320-1=319
+	 * bit[13:6] : VFPD, 发出最后一行数据之后，再过多长时间才发出VSYNC
+	 *             LCD手册T2-T5=322-320=2,所以VFPD=2-1=1
+	 * bit[5:0]  : VSPW, VSYNC信号的脉冲宽度, LCD手册T1=1, 所以VSPW=1-1=0
+	 */
+		lcd_regs->lcdcon2  = (1<<24) | (271<<14) | (1<<6) | (9);
+
+
+	/*水平方向的时间函数
+	 * bit[25:19]: HBPD, VSYNC之后再过多长时间才能发出第一行数据
+	 *             LCDÊ手册 T6-T7-T8=17
+	 *             HBPD=16
+	 * bit[18:8]: 多少列, 240, 所以：HOZVAL=240-1=239
+	 * bit[7:0] : HFPD, 发出最后一行里最后一个像素数据之后，再过多长时间才发出HSYNC
+	 *             LCD手册：T8-T11=251-240=11, 所以：HFPD=11-1=10
+	 */
+		lcd_regs->lcdcon3 = (1<<19) | (479<<8) | (1);
+
+	/* 水平方向的同步信号
+	 * bit[7:0]	: HSPW, HSYNC信号的脉冲宽度, LCD手册T7=5,所以：HSPW=5-1=4
+	 */	
+		lcd_regs->lcdcon4 = 40;
+
+#else
+lcd_regs->lcdcon2 =	S3C2410_LCDCON2_VBPD(5) | \
+		S3C2410_LCDCON2_LINEVAL(319) | \
+		S3C2410_LCDCON2_VFPD(3) | \
+		S3C2410_LCDCON2_VSPW(1);
+
+lcd_regs->lcdcon3 =	S3C2410_LCDCON3_HBPD(10) | \
+		S3C2410_LCDCON3_HOZVAL(239) | \
+		S3C2410_LCDCON3_HFPD(1);
+
+lcd_regs->lcdcon4 =	S3C2410_LCDCON4_MVAL(13) | \
+		S3C2410_LCDCON4_HSPW(0);
+
+#endif
+	/* 信号的极性
+	 * bit[11]: 1=565 format
+	 * bit[10]: 0 = The video data is fetched at VCLK falling edge
+	 * bit[9] : 1 = HSYNC信号要反转，即低电平有效
+	 * bit[8] : 1 = VSYNC信号要反转，即低电平有效
+	 * bit[6] : 0 = VDEN不用反转
+	 * bit[3] : 0 = PWREN输出0
+	 * bit[1] : 0 = BSWP
+	 * bit[0] : 1 = HWSWP 2440	手册P413
+	 */
+	lcd_regs->lcdcon5 = (1<<11) | (0<<10) | (1<<9) | (1<<8) | (1<<0);
+	
+	
+	
+	③配置引脚用于LCD	
+	
+4. 注册: 
+	register_framebuffer(s3c_lcd);
+	
+static struct fb_ops s3c_lcdfb_ops = {
+	.owner			= THIS_MODULE,
+	.fb_setcolreg	= s3c_lcdfb_setcolreg,
+	.fb_fillrect	= cfb_fillrect,
+	.fb_copyarea	= cfb_copyarea,
+	.fb_imageblit	= cfb_imageblit,
+};
+	分析：
+	每一个fbops都有cfb_fillrect；cfb_copyarea；cfb_imageblit；这三个函数
+	cfb_fillrect：填充矩形
+	cfb_copyarea：拷贝区域
+	cfb_imageblit：
+-----------------------------------------------------------------------------------------------
+国嵌：
+①：struct fb_ops包含了对控制器进行操作函数，你如果没有配置，那内核会帮你实现，如果配置，就用你的
+    struct fb_ops {
+        struct module *owner;
+        int (*fb_open)(struct fb_info *info, int user);
+        int (*fb_release)(struct fb_info *info, int user);
+        ssize_t (*fb_read)(struct fb_info *info, char __user *buf,size_t count, loff_t *ppos);
+        ssize_t (*fb_write)(struct fb_info *info, const char __user *buf,size_t count, loff_t *ppos);            
+    ...}
+
+《LCD架构学习》
+①：Fbmen.c（drivers/video）
+    ①：static int __init  fbmem_init(void)  
+        {
+             //fbmem_init注册了一个主设备号为29的字符设备，并创了graphics类（图形类）。
+             register_chrdev(FB_MAJOR,"fb",&fb_fops)
+        }
+    ②：
+        字符设备有一个关键的成员是文件操作结构体
+        static const struct file_operations fb_fops = {  
+            .owner          = THIS_MODULE,  
+            .read           = fb_read,  
+            .mmap           = fb_mmap, 
+            ...
+        }; 
+        
+    ③：static intfb_open(struct inode *inode, struct file *file)
+        {
+            int fbidx = iminor(inode);      /* 得到次设备号 */
+            info = registered_fb[fbidx];    /* 使用次设备号得到fb_info结构体 */ 
+            mutex_lock(&info->lock);     /* 获取mutex */ 
+            /* 从registered_fb[]数组项里找到一个fb_info结构体保存到 
+             * struct file结构中的私有信息指针赋值给它呢是为了以后调用 
+             * read、write、ioctl等系统调用时找到这个struct fb_info结构
+             * struct file *file         
+             */
+            file->private_data = info; 
+            ...
+            mutex_unlock(&info->lock);   /* 释放mutex */              
+        }
+        发现fb_open函数是围绕fb_info来实现的，而fb_info设置为registered_fb[fbidx]
+        问：registered_fb[fbidx]结构体数组是在哪里被设置？
+        答：register_framebuffer函数里设置registered_fb
+    ④：/* register_framebuffer()函数的主要工作是设置fb_info结构体的一些成员 */  
+        int  register_framebuffer(struct fb_info *fb_info) 
+    ⑤： fb_read函数源码分析
+        static ssize_t  fb_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)  
+        {
+            /* 获取次设备号 */  
+            int fbidx = iminor(inode);  
+            /* 以次设备号为下标找到一项fb_info结构体 */  
+            struct fb_info *info = registered_fb[fbidx];
+            if (!info || ! info->screen_base) /* screen_base是虚拟(显存)基地址 */  
+            return -ENODEV;  
+  
+        } 
+    ⑥：fb_mmap源码分析
+        /* 这里分配的显存是在内核空间分配的，用户空间并不能直接访问， 
+         * 所以需要用到这里的mmap函数，直接将这段内存空间映射到 
+         * 用户空间去，用户空间就能访问这段内存空间了。 
+         */  
+    static int  fb_mmap(struct file *file, struct vm_area_struct * vma)  
+    __acquires(&info->lock)  
+    __releases(&info->lock)  
+    {
+        struct fb_info *info = registered_fb[fbidx]; /* 通过次设备号找到fb_info结构体 */
+         /* io_remap_pfn_range正式映射物理内存到用户空间虚拟地址 */  
+        if (io_remap_pfn_range(vma, vma->vm_start, off >> PAGE_SHIFT,  
+                     vma->vm_end - vma->vm_start, vma->vm_page_prot))  
+            return -EAGAIN; 
+    }
+---------------------------------------------------------------------------------------------
+测试：
+1. make menuconfig去掉原来的驱动程序
+-> Device Drivers
+  -> Graphics support
+<M> S3C2410 LCD framebuffer support
+
+2. make uImage
+   make modules  
+
+3. 使用新的uImage启动开发板:
+
+4. 
+insmod cfbcopyarea.ko 
+insmod cfbfillrect.ko 
+insmod cfbimgblt.ko 
+insmod lcd.ko
+
+echo hello > /dev/tty1  // 可以在LCD上看见hello
+cat lcd.ko > /dev/fb0   // 花屏
+
+5. 修改 /etc/inittab
+tty1::askfirst:-/bin/sh
+用新内核重启开发板
+
+insmod cfbcopyarea.ko 
+insmod cfbfillrect.ko 
+insmod cfbimgblt.ko 
+insmod lcd.ko
+insmod buttons.ko
+
+----------------------------------------------------------------------------------------------
+dmesg命令:
+
+功能说明：显示开机信息。
+语　　法：dmesg [-cn][-s <缓冲区大小>]
+补充说明：kernel会将开机信息存储在ring buffer中。您若是开机时来不及查看信息，可利用dmesg来查看。开机信息亦保存在/var/log目录中，名称为dmesg的文件里。
+
+参　　数：
+　-c 　显示信息后，清除ring buffer中的内容。 
+　-s<缓冲区大小> 　预设置为8196，刚好等于ring buffer的大小。 
+　-n 　设置记录信息的层级。
+
+扩展阅读一:dmesg命令主要用途
+
+主要应用：
+dmesg用来显示内核环缓冲区（kernel-ring buffer）内容，内核将各种消息存放在这里。在系统引导时，内核将与硬件和模块初始化相关的信息填到这个缓冲区中。内核环缓冲区中的消息对于诊断系统问题 通常非常有用。在运行dmesg时，它显示大量信息。通常通过less或grep使用管道查看dmesg的输出，这样可以更容易找到待查信息。例如，如果发现硬盘性能低下，可以使用dmesg来检查它们是否运行在DMA模式：
+$dmesg | grep DMA
+...
+ide0: BM-DMA at 0xf000-0xf007, BIOS settings: hda:DMA, hdb:DMA
+ide1: BM-DMA at 0xf008-0xf00f, BIOS settings: hdc:DMA, hdd:DMA
+...
+上面几行可以说明每个IDE设备正在什么模式下运行。如果以太网连接出现问题，那么可以在dmesg日志中搜索eth：
+$dmesg | grep eth
+forcedeth.c: Reverse Engineered nForce
+ethernet driver. Version 0.49.
+eth0: forcedeth.c: subsystem: 0147b:1c00
+bound to 0000:00:04.0
+eth0: no IPv6 routers present
+如果一切正常，那么dmesg显示每个网卡的硬件配置信息。如果某项系统服务未能得到正确的配置，dmesg日志很快就填满错误消息，这是诊断故障的良好起点。
+还可以用来探测系统内核模块的加载情况，比如要检测ACPI的加载情况，使用dmesg | grep acpi
+ dmesg |egrep -i ''(apm|acpi)'' 
+  Kernel command line: vga=274 quiet console=ttyS3,9600acpi=no-idleoot=/dev/hda3 
+  ACPI: Core Subsystem version [20010208]  
+  ACPI: Subsystem enabled  
+  ACPI: System firmware supports: C2  
+  ACPI: plvl2lat=99 plvl3lat=1001 
+  ACPI: C2 enter=1417 C2 exit=354 
+  ACPI: C3 enter=-1 C3 exit=-1 
+  ACPI: Not using ACPI idle 
+  ACPI: System firmware supports: S0 S1 S4 S5
+ 
+
+使用示例
+示例一 将开机信息发邮件
+[root@new55 ~]# dmesg >boot.messages
+[root@new55 ~]# ls -l boot.messages 
+-rw-r--r-- 1 root root 15838 12-09 12 begin_of_the_skype_highlighting 15838 12-09 12 免费  end_of_the_skype_highlighting:55 boot.messages
+[root@new55 ~]# mail -s "Boot Log of Linux Server" public@web3q.NET <boot.messages 
+[root@new55 ~]#
+示例二 浏览dmesg输出的信息
+[root@new55 ~]# uname -a
+示例三 查看dmesg尾部的信息
+[root@new55 ~]# dmesg | tail
+示例五 打印并清除内核环形缓冲区
+[root@new55 ~]# dmesg -c
+
+

@@ -1,0 +1,194 @@
+分离分层：
+分层：例：input.c（上层）和（buttons.c,evdev.c)（下层）。下层向上层提供统一的接口，每一层专注自己的事情
+分离：例：evdev.c-纯软件(稳定)；和buttons.c-硬件相关；分离就是把硬件相关的东西抽出来，把软件相对稳定的东西抽出来
+
+linux在引入了platform机制之后，内核假设所有的这些外设都挂载在platform虚拟总线上,以便进行统一管理。
+    在系统中platform对应的文件drivers/base/platform.c，它不是作为一个模块注册到内核的，关键的注册总线
+    的函数由系统初始化部分，对应/init/main.c中的do_basic_setup函数间接调用。这里可以看出platform非常
+    重要，要在系统其他驱动加载之前注册。
+    platform总线是在内核初始化的时候就注册进了内核
+----
+bus_drv_dev模型：
+	bus总线
+	device放硬件相关的东西
+	向bus总线注册device_add，device_add会将device这个结构体，放入bus的某个链表里面
+	device_add要做的事情：
+	1、把device放入bus的dev链表			
+	2、从bus的drv链表取出每一个drv，用bus的match函数判断drv能否支持device
+	3、如果能够支持,调用drv的probe函数，probe函数里面做什么由你决定，所以probe函数才是我们关心的内容
+-------------------------------------------------------------------------
+选取部分leds.dev代码分析
+static struct platform_device led_dev = {
+    .name         = "myled",
+    .id       = -1,
+    .num_resources    = ARRAY_SIZE(led_resource),
+    .resource     = led_resource,
+    .dev = { 
+    	.release = led_release, 
+	},
+};
+	分析：
+	这个就是device结构体，通过init函数中的platform_device_register(&led_dev);向上注册，将这个结构体放入bus总线的链表当中
+	.name一定要和drv当中的名字一样，这样系统才可以进行牵线
+	.release函数：可以放些硬件相关的代码在这里，暂时不做什么
+		 release()完成与open()相反的工作.释放open()向内核申请的所有资源.实际使用过程中主要注意两点:
+			2-1.close()并不完全是release():
+			内核对每个file结构维护其被使用的计数,无论是fork还是dup,都不会创建新的数据结构,如fork和dup,
+			它们只是增加已有(由open生成)结构中的计数.只有在file结构的计数为0时,close才会实质地调用release
+			因此,并不是每个close系统调用都会引起对release方法的调用;
+			2-2.内核自动关闭:
+			内核在进程退出时,会在内部使用close系统调用自动关闭所有相关文件.
+	.resource资源，系统有很多资源，这里写led_resource，然后自己.resource的格式写个led_resource资源出来，如下
+static struct resource led_resource[] = {
+    [0] = {
+        .start = 0x56000050,
+        .end   = 0x56000050 + 8 - 1,
+        .flags = IORESOURCE_MEM,
+    },
+    [1] = {
+        .start = 5,
+        .end   = 5,
+        .flags = IORESOURCE_IRQ,
+    }
+};
+	分析：
+	resource led_resource，led资源，被扔入bus总线的链表中，然后被drv引用resource结构体重的数据，在对应右边的drv中进行分析操作。 
+	IORESOURCE_MEM：物理地址；0x56000050是con寄存器的起始物理地址；
+	IORESOURCE_IRQ：是该寄存器的第五位，即是GP?5。指定了某一个pin
+	以上数据可以保持稳定，假如你要换过一个寄存器的话，修改第一个数组里面的起始和结束地址，假如要修改该寄存器的某一位（换个意思就是那一盏灯亮）的话就修改第二个数组的数值；
+static void led_dev_exit(void)
+{
+	platform_device_unregister(&led_dev);
+}
+	分析：
+	进行rmmod led_dev的时候，进行unregister函数，在链表中要把led_dev取出来，这样的话就会通过总线进行调用，drv的remove函数，然后进行remove函数里面的操作
+	
+-------------------------------------------------------------------------
+总线里面有个比较函数bus.match,来验证右边的driver能否支持左边的硬件设备device，如果能够支持的话
+就调用各自里面的.probe函数；
+这只不过是左右建立的一种机制。
+--------------------------------------------------------------------------
+	driver放入比较稳定，不常修改的代码
+	向bus总线注册driver_register，driver_register会将driver这个结构体，放入bus的某个链表里面，叫drv链表
+	driver_register要做的事情：
+	1、放入drv链表
+	2、从dev链表链表取出每一个dev，一一比较，用bus的match函数判断drv能否支持device
+	3、若支持，调用probe，然后编写probe函数完成你要做什么的目的
+-------------------	-------------------------------------------------------
+选取部分leds.drv代码分析
+struct platform_driver led_drv = {				
+	.probe		= led_probe,					
+	.remove		= led_remove,					
+	.driver		= {
+		.name	= "myled",							
+	}
+};
+	分析：
+	这个就是drv结构体，通过init函数中的platform_driver_register(&led_drv);函数进行注册后放入到bus的链表中
+	注意drv中.name一定要和device中的.name一样，这样bus总线才能将两者结合在一起。
+	这里面就有led_probe函数和led_remove函数
+---
+static int led_probe(struct platform_device *pdev)				
+{
+	struct resource		*res;
+	/* 根据platform_device的资源进行ioremap */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	gpio_con = ioremap(res->start, res->end - res->start + 1);			
+	gpio_dat = gpio_con + 1;											
+
+	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
+	pin = res->start;
+	
+	/* 注册字符设备驱动程序 */
+	printk("led_probe, found led\n");
+	major = register_chrdev(0, "myled", &led_fops);
+	cls = class_create(THIS_MODULE, "myled");											
+	class_device_create(cls, NULL, MKDEV(major, 0), NULL, "led"); /* /dev/led */	
+	
+	return 0;
+}
+	分析：
+	//probe函数，里面就是我们对device的大致处理
+	//res里面有好几个参数，其中start,end 就是。res->end - res->start + 1是该长度
+	//指针加一等于字节数加四
+	cls = class_create(THIS_MODULE, "myled");//创建类	
+	class_device_create(cls, NULL, MKDEV(major, 0), NULL, "led"); /* /dev/led *///在类下面创建设备，但是没有创建设备节点，因为系统会帮我们自动创建设备节点
+---
+	
+static int led_remove(struct platform_device *pdev)				//进行驱动程序的卸载
+{
+	/* 卸载字符设备驱动程序 */
+	/* iounmap */
+	printk("led_remove, remove led\n");
+
+	class_device_destroy(cls, MKDEV(major, 0));
+	class_destroy(cls);
+	unregister_chrdev(major, "myled");
+	iounmap(gpio_con);
+	
+	return 0;
+}
+static struct file_operations led_fops = {
+    .owner  =   THIS_MODULE,    /* 这是一个宏，推向编译模块时自动创建的__this_module变量 */
+    .open   =   led_open,     
+	.write	=	led_write,	   
+};
+---------------------------------------------------------------------------
+platform
+①：remove函数
+    卸载platform驱动或platform device都会调用platform_driver.platform_device函数，这个函数在驱动程序里面可以自己编写
+    为什么device卸载也会调用呢？其实你可以看platform_device结构体里面没有remove函数，而且bus总线这些好像也是
+    调用驱动里面的程序。
+    platform_device
+        /*linux/platform_device.h*/
+        struct platform_device {
+            const char * name; //设备的名字，这将代替device->dev_id，用作sys/device下显示的目录名
+            int id; //设备id，用于给插入给该总线并且具有相同name的设备编号，如果只有一个设备的话填-1。
+            struct device dev; //结构体中内嵌的device结构体。
+            u32 num_resources; //资源数。
+            struct resource * resource; //用于存放资源的数组。
+    };
+    platform_driver 
+        struct platform_driver {
+        int (*probe)(struct platform_device *);
+        int (*remove)(struct platform_device *);
+        void (*shutdown)(struct platform_device *);
+        int (*suspend)(struct platform_device *, pm_message_t state);
+        int (*suspend_late)(struct platform_device *, pm_message_t state);
+        int (*resume_early)(struct platform_device *);
+        int (*resume)(struct platform_device *);
+        struct device_driver driver;
+    };
+        可以看到，platform_driver结构体内嵌了device_driver，并且实现了prob、remove等操作。其实，当内核需要调用probe函数时，
+        它会调用driver->probe，在driver->probe中再调用platform_driver->probe。如果想了解清楚的话建议查看内核源代码。
+②：获取平台资源
+    platform_get_resource
+    driver.c
+        res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+        res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
+    device.c
+        static struct resource led_resource[] = {
+            [0] = {
+                .start = 0x56000050,
+                .end   = 0x56000050 + 8 - 1,
+                .flags = IORESOURCE_MEM,
+            },
+            [1] = {
+                .start = 5,
+                .end   = 5,
+                .flags = IORESOURCE_IRQ,
+            }
+
+        };
+    说明： 
+        第一个参数：对应device.c里面的平台设备信息 struct platform_device *pdev 
+        第二个参数：对应decice.c里面的flages，看你要选哪个
+        第三个参数：选择0，因为这样就让最后一个参数失去选择，只要选好第二个就行，当然resource
+                    数组的不同项的flags都要不一样			
+			
+			
+			
+			
+			
+			
+			

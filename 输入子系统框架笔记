@@ -1,0 +1,394 @@
+关键字：输入子设备
+------------------------------------------------------------------------------------------------------------------
+之前字符设备的框架！！！
+	   1、主设备号
+	   2、构造一个file_operations结构体
+				.open
+				.read
+				.write
+				.poll
+				.fasync
+	   3、（告诉内核）register_chrdev(主设备号，home，file_operations) 
+	   4、入口 来调用它
+	   5、出口
+输入子系统的框架！！
+1. 分配一个input_dev结构体(如下所示)
+2. 设置
+3. 注册
+4. 硬件相关的代码，比如在中断服务程序里上报事件 有数据产生时，调用input_event
+
+输入子系统：使用现成的驱动，可以把别人的驱动程序进行直接移植
+APP:	open,read,writ
+驱动:	drv_open,drv_read,drv_weite
+硬件
+#####################################################################################################################
+一、input子系统
+输入子系统框架(!!要把框架弄清楚)：
+   核心层：input.c  大概就是一个中转的作用
+   drivers/input/input.c：
+	input_init > err = register_chrdev(INPUT_MAJOR, "input", &input_fops);	//以前这个register_chrdev是我们自己构造的，现在内核里面已经构造好了
+	打开上句中的input_fops结构体：	
+	static const struct file_operations input_fops = {
+	.owner = THIS_MODULE,
+	.open = ,
+};
+------------------------------------------------------------------------------------------		
+问：怎么读按键？（这个是大致的框架，就是大致的过程）
+跳转到input_open_file里面
+	static int input_open_file(struct inode *inode, struct file *file)
+{
+	struct input_handler *handler = input_table[iminor(inode) >> 5];//在这个数组里面根据他的此设备号找到
+				handler里面有file_operations结构体：const struct file_operations *fops;
+		if (!handler || !(new_fops = fops_get(handler->fops)))		//获得一个新的fops结构体;
+			file->f_op = new_fops;									//然后所打开文件的f_op等于这个新的fops;
+				err = new_fops->open(inode, file);					//然后再调用这个新的fops里面的open函数
+				
+app: read > ... > file->f_op->read  								//app在这个函数里面找到读函数，就可以读出按键值了	
+------------------------------------------------------------------------------------------		
+------------------------------------------------------------------------------------------		
+问input_table数组由谁构造？
+	由input_register_handler构造		构造了input_table[handler->minor >> 5] = handler;这个数组项
+		input_register_handler被各种驱动调用。例如joydev.c keyboard.c mousedev.c tsdev.c
+------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------				
+软件层：向上（就是向核心层input.c）注册input_register_handler//handler是一个纯软件的概念
+  	 				 evdev.c,keybord.c,mousedev.c				
+		例如：参考这个evdev驱动函数，看这个流程下来就可以理解得差不多了！
+			static struct input_handler evdev_handler = {	//就是该结构体
+				.event =	evdev_event,			
+				.connect =	evdev_connect,			// 与设备（硬件）进行连接
+				.disconnect =	evdev_disconnect,	// 
+				.fops =		&evdev_fops,			//以前这个fops是我们自己构造，如今系统帮我们构造好了
+				.minor =	EVDEV_MINOR_BASE,		
+				.name =		"evdev",
+				.id_table =	evdev_ids,				//表示能够支持哪些设备,设备中的input_device就会和.id_table进行比较，如果表示能够支持的话
+													//就调用connect函数将evdev.c等驱动程序与设备进行建立连接
+			};	
+			static const struct file_operations evdev_fops = {		//这就是系统帮我们构造好的fops函数。
+				.owner =	THIS_MODULE,
+				.read =		evdev_read,
+				.write =	evdev_write,
+				.poll =		evdev_poll,
+				.open =		evdev_open,								//当open的时候就会调用我们该结构体中的open函数
+				.release =	evdev_release,
+				.unlocked_ioctl = evdev_ioctl,
+
+			};
+			
+			static int evdev_open(struct inode *inode, struct file *file)
+			{
+				evdev = evdev_table[i];//这个就不大好分析了。会重新回来分析的！！！！！！！！！！
+			}
+			
+			static int __init evdev_init(void)					
+			{
+				return input_register_handler(&evdev_handler);//注册input_register_handler结构体
+			}
+-----------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------	
+硬件层：向上（就是向核心层input.c）注册input_register_device函数
+			谁会调用input_register_device函数？？	答：各种Atkbd.c Amimouse.c 各种按键,鼠标
+----注册input_handler：
+	input_register_handler:
+		// 放入数组
+		input_table[handler->minor >> 5] = handler;
+		// 放入链表
+		list_add_tail(&handler->node, &input_handler_list);
+		// 对于每个input_dev，调用input_attach_handler
+		list_for_each_entry(dev, &input_dev_list, node)
+			input_attach_handler(dev, handler);					 // 根据input_handler的id_table判断能否支持这个input_dev
+---注册输入设备: 
+	input_register_device
+		// 放入链表
+		list_add_tail(&dev->node, &input_dev_list);
+		// 对于每一个input_handler，都调用input_attach_handler
+		list_for_each_entry(handler, &input_handler_list, node)
+			input_attach_handler(dev, handler); 				// 根据input_handler的id_table判断能否支持这个input_dev
+
+	input_attach_handler
+		id = input_match_device(handler->id_table, dev);		//
+		error = handler->connect(handler, dev, id);
+	
+	注册input_dev或input_handler时，会两两比较左边的input_dev和右边的input_handler,
+	根据input_handler的id_table判断这个input_handler能否支持这个input_dev，
+	如果能支持，则调用input_handler的connect函数建立"连接"
+===========怎么建立连接？=============================================================================================================
+
+1. 分配一个input_handle结构体
+	struct input_handle {
+		void *private;
+		int open;
+		const char *name;
+
+		struct input_dev *dev;					//input_handle->dev
+		struct input_handler *handler;			//input_handle->handler
+
+		struct list_head	d_node;
+		struct list_head	h_node;
+	}    
+	说明：
+    open表示handle是否正在被使用，当使用的时候，会将事件发给设备处理
+    *name 表示handler的名字，显示在/proc/bus/input/handlers目录中
+    *dev表示该handle依附的input_dev设备
+    *handler指向input_dev
+    d_node使用这个变量将handle放到设备相关的链表中，也就是放到input_dev->h_list表示链表中去，
+    h_node使用这个变量将handle放到设备相关的链表中，也就是放到handler->h_list表示链表中去
+2. 	input_handle.dev = input_dev;  			// 指向左边的input_dev
+	input_handle.handler = input_handler;   // 指向右边的input_handler
+3. 注册：
+   input_handler->h_list = &input_handle;				//右边的input_handler->h_list指向input_handle结构体
+   inpu_dev->h_list      = &input_handle;				//左边的inpu_dev->h_list 也指向input_handle结构体
+举例evdev_connect！！！！！！！！！！！！！！
+	evdev_connect其实就是 input_handler里面的.connect，如下函数所示
+	1. 分配一个input_handle结构体
+					static struct input_handler evdev_handler = {
+						.event 		 =	evdev_event,
+						.connect	 =	evdev_connect,
+						.disconnect  =	evdev_disconnect,
+						.fops 		 =	&evdev_fops,
+						.minor 		 =	EVDEV_MINOR_BASE,
+						.name		 =	"evdev",
+						.id_table	 =	evdev_ids,
+					};
+	evdev_connect（进入该函数如下所示）
+		evdev = kzalloc(sizeof(struct evdev), GFP_KERNEL); // 分配一个input_handle
+	2.设置
+		input_handle.dev 	 = input_dev;  			// 指向左边的input_dev
+		input_handle.handler = input_handler;       // 指向右边的input_handler	
+	-----	
+		evdev->handle.dev	  = dev; 					 // 指向左边（即是输入设备）的input_dev
+		evdev->handle.name 	  = evdev->name;
+		evdev->handle.handler = handler;  				 // 指向右边（即是软件层）的input_handler
+		evdev->handle.private = evdev;
+		
+	3. 注册：
+		error = input_register_handle(&evdev->handle);
+			int input_register_handle(struct input_handle *handle)	
+				input_handle.handler		//记录在input_handler.h_list     
+				input_handle.dev 			//记录在input_device.h_list	
+-------------------------------------------------------------------------------------------------------------------------
+小结：
+	input.handle是个很重要的函数，通过它进行设备层和软件层的连接，起到了一个中间桥梁的作用
+		软件层指向设备层通过input.handle.dev
+		设备层指向软件层通过input.handle.handler			 
+
+		input_device.h_list和input_handler.h_list都指向input_handle函数，则双方都可以从input_handle找到所需要的信息。
+		设备层通过input_handle结构体中的.handler函数（即是input_handle.handler）指向右边软件层
+		硬件层通过input_handle结构体中的.dev函数（即是input_handle.dev）指向左边设备层的input_device
+			input_handle.handler		//记录在input_handler.h_list     //input_handler.h_list存在软件层的input_handler的结构体中！！！
+			input_handle.dev 			//记录在input_device.h_list		 //input_device.h_list存在硬件层的input_device的结构体中！！！！
+-------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------
+怎么读按键？
+app: read 
+  .......
+   	①：evdev_read（不用自己去写，都是系统写好的函数）
+			static ssize_t evdev_read(struct file *file, char __user *buffer, size_t count, loff_t *ppos)
+			{   //无数据并且是非阻塞方式打开，则立刻放回
+				//为什么说无数据呢，因为这是个环形缓冲区，头等于尾说明是空的
+			 ...if (client->head == client->tail && evdev->exist && (file->f_flags & O_NONBLOCK))
+					return -EAGAIN;
+				//否知休眠,直到头不等于尾
+				retval = wait_event_interruptible(evdev->wait,
+					client->head != client->tail || !evdev->exist);
+				//如果非空
+			 ...while (client->head != client->tail && retval + evdev_event_size() <= count) {
+					if (evdev_event_to_user(buffer + retval, event))
+					//这个实际上是调用copy_to_user(buffer, event, sizeof(struct input_event)
+				}
+
+    ②：谁来唤醒？
+        evdev_event这个事件处理函数来唤醒
+        static void evdev_event(struct input_handle *handle, unsigned int type, unsigned int code, int value)
+         {   ...wake_up_interruptible(&evdev->wait);}
+    ③：那evdev_event被谁调用？
+        也就是谁来上报事件？
+        应该是硬件相关代码，input_dev那层调用的
+        在设备的中断服务函数里面，确定事件是什么，然后调用响应的input_handler的event处理函数
+        比如例子gpio_keys_isr就是调用 evdev_event 的函数
+        例子:
+		static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
+                {   ...
+                    //上报事件
+                    input_event(input, type, button->code, !!state);		//input_event拿来上报事件的
+                    input_sync(input);
+                }
+            void input_event(struct input_dev *dev, unsigned int type, unsigned int code, int value)
+                {  
+                    struct input_handle *handle;								//
+                    ...
+                    list_for_each_entry(handle, &dev->h_list, d_node)			//遍历所有链表，即是对dev->h_list的每一个handle，如果满足
+                    if (handle->open)											//如果当中有一个是打开的就调用他的handler，调用event函数
+                    handle->handler->event(handle, type, code, value);...
+				}
+				-----------------------------
+					例：buttons.c函数里面：
+						static void buttons_timer_function(unsigned long data)
+						{
+							struct pin_desc * pindesc = irq_pd;
+							pinval = s3c2410_gpio_getpin(pindesc->pin);
+							if (pinval)
+							{
+								input_event(buttons_dev, EV_KEY, pindesc->key_val, 0);	//上报事件，松开（0）
+								input_sync(buttons_dev);								//再上报一个同步事件，input_sync属于同步类事件，input_sync表示这个已经上报完
+							}
+							else
+							{
+								input_event(buttons_dev, EV_KEY, pindesc->key_val, 1);	//上报事件，按下（1）
+								input_sync(buttons_dev);
+							}
+						}
+									input_event函数里面：
+										list_for_each_entry(handle, &dev->h_list, d_node)
+										if (handle->open)
+											handle->handler->event(handle, type, code, value);
+---------------------------------------------------------------------------------------------------------------------------
+怎么写符合输入子系统框架的驱动程序？
+1. 分配一个input_dev结构体
+2. 设置
+3. 注册
+4. 硬件相关的代码，比如在中断服务程序里上报事件
+
+例子：参考buttons.c
+	static int buttons_init(void)
+	{
+		int i;
+		/* 1. 分配一个input_dev结构体 */
+		buttons_dev = input_allocate_device();;
+
+		/* 2. 设置 */
+		/* 2.1 能产生哪类事件 */
+		set_bit(EV_KEY, buttons_dev->evbit);			//表示能产生按键类事件
+		set_bit(EV_REP, buttons_dev->evbit);			//表示能产生重复类事件
+		
+		/* 2.2 能产生这类操作里的哪些事件: L,S,ENTER,LEFTSHIT */
+		set_bit(KEY_L, buttons_dev->keybit);			
+		set_bit(KEY_S, buttons_dev->keybit);			//能够产生L,S,ENTER,LEFTSHIT按键
+		set_bit(KEY_ENTER, buttons_dev->keybit);		
+		set_bit(KEY_LEFTSHIFT, buttons_dev->keybit);		
+
+		/* 3. 注册 */
+		input_register_device(buttons_dev);				//注册之后把这个设备放入input_device的链表，然后一个个取出来和input_handler的链表进行一一比较，如果id_table能够匹配，就调用connect函数
+		
+		/* 4. 硬件相关的操作 */
+		init_timer(&buttons_timer);						//设置定时器，是为了防抖动
+		buttons_timer.function = buttons_timer_function;
+		add_timer(&buttons_timer);
+		
+		for (i = 0; i < 4; i++)
+		{
+			request_irq(pins_desc[i].irq, buttons_irq, IRQT_BOTHEDGE, pins_desc[i].name, &pins_desc[i]);		//注册中断
+		}
+		
+		return 0;
+	}
+--------------------------------------------------------------------------------------------------------------------------
+Linux输入子系统evdev.c文件分析
+    ①：事件处理层文件主要是用来支持输入设备并与用户空间交互，，这部分代码一般不需要我们自己去编写，
+        因为Linux内核已经自带有一些事件处理器，可以支持大部分输入设备，比如evdev.c、mousedev.c、joydev.c等。
+        一个事件处理器用struct input_handler结构体来表示，当向系统注册一个事件处理器时，系统会将该处理器加入
+        input_handler_list链表中，并从input_dev_list链表中取出每一个dev，调用input_attach_handler看看是否支
+        持该设备。上面蓝色粗体语句表明，当注册一个handler时，它会去设置input_table数组的某一项，input_table
+        的定义在input.c中（static struct input_handler *input_table[8]; ），从这个数组中我们也可以看出该系
+        统最多支持8个事件处理器。对于输入子系统无论是注册设备input_register_device还是注册事件处理器
+        input_register_handler最终都会调用到input_attach_handler进行匹配，当正确匹配的时候就会调用
+        handler的connect方法，接下来我们就分析evdev.c中evdev_connect到底做了什么。
+    ②：因为一个handler可以处理32个设备，所以evdev_handler所能处理的设备文件范围为（13,64）～（13,64+32），
+        其中13是所有输入设备的主设备号。
+        evdev_ids没有定义flags，也没有定义匹配属性值。这个evdev_ids的意思就是：evdev_handler可以匹配所有
+        input_dev设备，也就是所有的input_dev发出的事件，都可以由evdev_handler来处理。
+		
+			for (minor = 0; minor < EVDEV_MINORS && evdev_table[minor]; minor++);		//寻找次设备号
+			if (minor == EVDEV_MINORS) {
+				printk(KERN_ERR "evdev: no more free evdev devices\n");
+				return -ENFILE;
+			}
+			
+			devt = MKDEV(INPUT_MAJOR, EVDEV_MINOR_BASE + minor),						//构造某些东西？？？、
+			cdev = class_device_create(&input_class, &dev->cdev, devt,dev->cdev.dev, evdev->name);	//在类下面创建设备
+	
+输入子系统和字符设备驱动创建设备的区别：
+----在input.c中-----
+	err = class_register(&input_class);							//创建了类，但是没有在类下面创建设备
+	err = register_chrdev(INPUT_MAJOR, "input", &input_fops);	//注册了fops结构体
+----在以前的字符驱动设备中：-----
+	major = register_chrdev(0, "sixth_drv", &sencod_drv_fops);
+	sixthdrv_class = class_create(THIS_MODULE, "sixth_drv");	//创建了类
+	sixthdrv_class_dev = class_device_create(sixthdrv_class, NULL, MKDEV(major, 0), NULL, "buttons"); /* /dev/buttons */    //在类下面创建了设备
+																															//这样在文件系统里面的mdev,或者udev才会自动的帮我们创建设备节点
+	区别就是：input.c只创建了类，但是没有在类下面创建设备，在设备驱动中即创建了类，也在下面创建了设备
+	创建设备过程：由我们注册了input_device之后，调用了右边的input_handler.connect函数来帮忙实现在类下面创建设备
+	evdev_connect
+		sprintf(evdev->name, "event%d", minor);
+		devt = MKDEV(INPUT_MAJOR, EVDEV_MINOR_BASE + minor),						
+		cdev = class_device_create(&input_class, &dev->cdev, devt,dev->cdev.dev, evdev->name);	
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+一：/dev/tty 当前终端，任何tty[任何类型的终端设备]echo "hello" > /dev/tty 都会直接显示在当前的终端中
+    对于你登录的shell，/dev/tty就是你使用的终端，设备号是（5,0）。使用命令”tty”可以查看它具体对应哪
+    个实际终端设备。 
+	    TTY(终端)是一类字符设备的统称，包括了三种类型：控制台，串口和伪终端
+    ①：控制台：
+        供内核使用的终端为控制台。控制台在linux启动时，通过命令console=...指定，如果没有指定控制台
+       （如tty0），系统会把第一个注册的终端（tty）作为控制台。
+        1.控制台是一个虚拟的中断，它必须映射到真正的终端上。
+    △△2.控制台可以简单的理解为pintk输出的地方。
+        3.控制台是个只输出的设备，功能很简单，只能在内核中访问
+    ②：伪终端：
+二：环形缓冲区：实际上就是一个数组
+	一开始有两个读写位置，读为0，写为0.
+	表示空：R==W			//空就是读等于写
+	表示写：buf[w]=value	//
+			w=(w+1)%len		
+	表示读：value=buf[R]	//
+			R=(R=1)%len
+	表示满：(w+1)%len==R 	//下一个位置等于读位置的时候
+三：struct input_dev {
+
+	void *private;
+
+	const char *name;
+	const char *phys;
+	const char *uniq;
+	struct input_id id;
+
+	unsigned long evbit[NBITS(EV_MAX)];   // 表示能产生哪类事件,有同步类，按键类，相对位移类事件，绝对位移事件（例如触摸屏）
+	unsigned long keybit[NBITS(KEY_MAX)]; // 表示能产生哪些按键
+	unsigned long relbit[NBITS(REL_MAX)]; // 表示能产生哪些相对位移事件, x,y,滚轮 即是relation 
+	unsigned long absbit[NBITS(ABS_MAX)]; // 表示能产生哪些绝对位移事件, x,y 
+	unsigned long mscbit[NBITS(MSC_MAX)];
+	unsigned long ledbit[NBITS(LED_MAX)];
+	unsigned long sndbit[NBITS(SND_MAX)];
+	unsigned long ffbit[NBITS(FF_MAX)];
+	unsigned long swbit[NBITS(SW_MAX)];
+
+测试:
+1. 
+hexdump /dev/event1  (open(/dev/event1), read(), )
+           秒        微秒    类  code    value
+0000000 0bb2 0000 0e48 000c 0001 0026 0001 0000
+0000010 0bb2 0000 0e54 000c 0000 0000 0000 0000
+0000020 0bb2 0000 5815 000e 0001 0026 0000 0000
+0000030 0bb2 0000 581f 000e 0000 0000 0000 0000
+
+2. 如果没有启动QT：
+cat /dev/tty1
+按:s2,s3,s4，就可以得到ls
+
+或者：
+exec 0</dev/tty1 		//0号文件即是标准输入改变到/dev/tty1,就可以改变到开发板的按键进行输入
+
+3. 如果已经启动了QT：
+可以点开记事本
+然后按:s2,s3,s4
+
+ 
+---------------------------------------
+
+
+
+
+
+
+

@@ -1,0 +1,239 @@
+网卡驱动
+
+  
+app:  socket
+--------------------------------------------------
+           ---------------
+           --------------- 若干层网络协议--纯软件
+           ---------------
+           ---------------
+hard_start_xmit||  /\ 
+               \/  ||  netif_rx   sk_buff
+           ---------------
+          硬件相关的驱动程序(要提供hard_start_xmit, 有数据时要用netif_rx上报)           
+--------------------------------------------------
+               硬件     
+			   
+1.网卡驱动并不是网络驱动，网络驱动有七层协议，网卡驱动只是最底层的驱动协议，硬件相关的驱动程序
+  硬件相关的驱动程序：收发功能
+  socket编程
+  
+  
+/*
+ * 参考 drivers\net\cs89x0.c
+ */
+怎么写网卡驱动程序？
+
+1. 分配一个net_device结构体
+2. 设置:
+	2.1 发包函数: hard_start_xmit
+		dev->hard_start_xmit 	= net_send_packet;
+			static int net_send_packet(struct sk_buff *skb, struct net_device *dev);		//skb buff数据
+	2.2 收到数据时(在中断处理函数里)用netif_rx上报数据
+		net_rx(struct net_device *dev)
+			netif_rx(skb);  		//上报一个skb
+		
+	2.3 其他设置
+3. 注册: register_netdevice
+  
+例：
+
+static int virt_net_send_packet(struct sk_buff *skb, struct net_device *dev)
+{
+	static int cnt = 0;
+	printk("virt_net_send_packet cnt = %d\n", ++cnt);
+
+	/* 对于真实的网卡, 把skb里的数据通过网卡发送出去 */
+	netif_stop_queue(dev); /* 停止该网卡的队列 */
+    /* ...... */           /* 把skb的数据写入网卡 */
+
+	/* 构造一个假的sk_buff,上报 */
+	emulator_rx_packet(skb, dev);
+
+	dev_kfree_skb (skb);   /* 释放skb */
+	netif_wake_queue(dev); /* 数据全部发送出去后,唤醒网卡的队列 */
+
+	/* 更新统计信息 */
+	dev->stats.tx_packets++;
+	dev->stats.tx_bytes += skb->len;
+	
+	return 0;
+}
+
+static int virt_net_init(void)
+{
+	/* 1. 分配一个net_device结构体 */
+	vnet_dev = alloc_netdev(0, "vnet%d", ether_setup);;  /* alloc_etherdev */
+	alloc_netdev原型：
+	struct net_device *alloc_netdev(int sizeof_priv, const char *name,void (*setup)(struct net_device *))
+	alloc_etherdev原型：
+		struct net_device *alloc_etherdev(int sizeof_priv)
+		{
+			return alloc_netdev(sizeof_priv, "eth%d", ether_setup);
+		}
+	分析：eth可以不用，可以写成vnet或者其他；
+		  ether_setup：是默认的设置函数；
+		  sizeof_priv：私有数据，可以设置0；私有数据就是额外使用的数据；
+
+		sizeof_priv
+	/* 2. 设置 */
+	vnet_dev->hard_start_xmit = virt_net_send_packet;
+	/* 设置MAC地址 */
+    vnet_dev->dev_addr[0] = 0x08;
+    vnet_dev->dev_addr[1] = 0x89;
+    vnet_dev->dev_addr[2] = 0x89;
+    vnet_dev->dev_addr[3] = 0x89;
+    vnet_dev->dev_addr[4] = 0x89;
+    vnet_dev->dev_addr[5] = 0x11;
+    /* 设置下面两项才能ping通 */
+	vnet_dev->flags           |= IFF_NOARP;
+	vnet_dev->features        |= NETIF_F_NO_CSUM;	
+
+	/* 3. 注册 */
+	//register_netdevice(vnet_dev);
+	register_netdev(vnet_dev);	//用下面这个函数，不用上面那个函数，是有关于rtnl_lock这个锁的问题；
+	
+	return 0;
+}
+  
+··············································       
+······ ··········· 博客 Linux驱动修炼之道  ················
+··············································   
+①：结构： （可以看上面韦东山版块）（sk_buff包传来传去）
+                
+                dev_queue_xmit              netif_rx            网络协议接口
+                    
+        ----------------------------------------------------------------------
+
+                       struct net_device                        网络设备接口
+                                                        （网络设备接口层的主要功能是为千变万化的网络设备定义了统一）
+        ----------------------------------------------------------------------
+
+            数据包发送                        数据包接收       
+          hard_start_xmit                   （中断方式处理）    设备驱动功能层
+           
+        ----------------------------------------------------------------------
+                        
+                        网络物理设备媒介                        设备媒介
+
+    说明： 
+        网络协议接口层：向网络层协议提供提供统一的数据包收发接口，不论上层协议为ARP还是IP，都通过dev_queue_xmit()
+            函数发送数据，并通过netif_rx()函数接受数据，并通过netif_rx()函数接受数据，这一层的存在使得上层协议独立
+            于具体的设备。 
+        网络设备接口层：向协议接口层提供统一的用于描述具体网络设备属性和操作的结构体net_device，该结构体是设备驱动
+            功能层中各函数的容器。实际上，网络设备接口层从宏观上规划了具体操作硬件的设备驱动功能层的结构。 
+        设备驱动功能层：它的各函数是网络设备接口层net_device数据结构的具体成员，是驱使网络设备硬件完成相应动作的程
+            序，他通过hard_start_xmit()函数启动发送操作，并通过网络设备上的中断触发接受操作。 
+②：
+    ①：网络协议接口层：
+        int dev_queue_xmit(struct sk_buff *skb)；
+        int netif_rx(struct sk_buff *skb); 
+        这里使用了一个skb_buff结构体，定义于include/linux/skbuff.h中，它的含义为“套接字缓冲区”，用于在Linux网络子系统
+        各层间传输数据。sk_buff中比较重要的成员是指向数据包中数据的指针。
+        他是一个双向链表，在老的内核中会有一个list域指向sk_buff_head也就是链表头，但是在我研究的
+        linux2.6.30.4内核中已经不存在了，如下图（百度）
+        操作套接字缓冲区的函数：
+        ①：分配
+            struct sk_buff *alloc_skb(unsigned int len, int priority);  
+            struct sk_buff *dev_alloc_skb(unsigned int len);       
+            
+            分配一个缓冲区，alloc_skb函数分配一个缓冲区并初始化skb->data和skb->tail为skb->head。参数len为数据缓冲
+            区的空间大小，通常以L1_CACHE_BYTES字节(对ARM为32)对齐，参数priority为内存分配的优先级。dev_alloc_skb()
+            函数以GFP_ATOMIC优先级进行skb的分配。
+        ②：释放：
+            void kfree_skb(struct sk_buff *skb);    
+            void dev_kfree_skb(struct sk_buff *skb); 
+            
+            Linux内核内部使用kfree_skb()函数，而网络设备驱动程序中则最好使用dev_kfree_skb()。？？？？？？？？？不懂
+            sk_buff中比较重要的成员是指向数据包中数据的指针，如下图所示：
+            
+                                               -----------      
+                            →→→→→→→→→|  headroom |
+                          ↑    →→→→→→→ -----------
+                          ↑  ↑              |           |
+                          ↑  ↑              |   data    |
+              --------    ↑  ↑              |           |
+             |  ...   |   ↑  ↑    →→→→→ -----------  
+             |  head  | →    ↑  ↑    →→→|  tailroom |
+             |  data  | →→→    ↑  ↑       -----------
+             |  tail  | →→→→→    ↑
+             |  end   | →→→→→→→
+             |  ...   |
+              --------
+            struct sk_buff {
+                sk_buff_data_t		tail;
+                sk_buff_data_t		end;
+                unsigned char		*head,
+				*data;
+            }
+            
+            说明：
+            用于寻址数据包中数据的指针，head指向已分配空间开头，data指向有效的octet开头，tail指向有效的octet结尾，
+            而end指向tail可以到达的最大地址。如果不这样做而分配一个大小固定的缓冲区，如果buffer不够用，则要申请一
+            个更大的buffer，拷贝进去再增加，这样降低了性能。
+    ②：网络设备接口层：
+        网络设备接口层的主要功能是为千变万化的网络设备定义了统一，抽象的数据结构net_device结构体，以不变应万变，
+        实现多种硬件在软件层次上的统一。
+        首先看打开和关闭网络设备的函数：   
+        
+        int (*open)(struct net_device *dev);    
+        int (*close)(struct net_device *dev);      
+        
+        要注意的是ifconfig是interface config的缩写，通常我们在用户空间输入:
+△△△△ifconfig eth0 up         
+        会调用这里的open函数。
+        在用户空间输入：
+△△△△ifconfig eth0 down 
+        会调用这里的stop函数。
+        说明：
+            在使用ifconfig向接口赋予地址时，要执行两个任务。首先，它通过ioctl(SIOCSIFADDR)(Socket I/O Control
+            Set Interface Address)赋予地址，然后通过ioctl(SIOCSIFFLAGS)(Socket I/O Control Set Interface Flags)
+            设置dev->flag中的IFF_UP标志以打开接口。这个调用会使得设备的open方法得到调用。类似的，在接口关闭时
+            ，ifconfig使用ioctl(SIOCSIFFLAGS)来清理IFF_UP标志，然后调用stop函数。
+            
+        int (*hard_header)(struct sk_buff *skb, struct net_device *dev, unsigned short type, void *daddr, void *saddr, unsigned len); 
+        
+        该方法根据先前检索到的源和目的硬件地址建立硬件头。
+        
+        int (*rebuild_header)(struct sk_buff *skb); 
+
+        以太网的mac地址是固定的，为了高效，第一个包去询问mac地址，得到对应的mac地址后就会作为cache把mac地址保存起
+        来。以后每次发包不用询问了，直接把包的地址拷贝出来。 
+        
+        void (*tx_timeout)(struct net_device *dev); 
+
+        如果数据包发送在超时时间内失败，这时该方法被调用，这个方法应该解决失败的问题，并重新开始发送数据。
+    
+        struct net_device_stats *(*get_stats)(struct net_device *dev); 
+
+        当应用程序需要获得接口的统计信息时，这个方法被调用。
+    ③：设备驱动接口层：
+        net_device结构体的成员(属性和函数指针)需要被设备驱动功能层的具体数值和函数赋予。对具体的设置xxx，
+        工程师应该编写设备驱动功能层的函数，这些函数型如xxx_open(),xxx_stop(),xxx_tx(),xxx_hard_header(),
+        xxx_get_stats(),xxx_tx_timeout()等。
+③：网络设备的初始化：
+    通过模块的加载函数看出DM9000A的驱动是以平台驱动的形式注册进内核的，下边是模块的加载函数：
+-------------------------------------------------------------------------------------------------------
+  
+测试1th/2th:
+1. insmod virt_net.ko
+2. ifconfig vnet0 3.3.3.3
+   ifconfig // 查看
+3. ping 3.3.3.3  // 成功   
+   ping 3.3.3.4  // 死机
+
+
+测试DM9000C驱动程序:
+1. 把dm9dev9000c.c放到内核的drivers/net目录下
+2. 修改drivers/net/Makefile 
+把
+obj-$(CONFIG_DM9000) += dm9000.o
+改为
+obj-$(CONFIG_DM9000) += dm9dev9000c.o
+3. make uImage
+   使用新内核启动
+4. 
+使用NFS启动
+或
+ifconfig eth0 192.168.1.17
+ping 192.168.1.1   

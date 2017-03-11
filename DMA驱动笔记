@@ -1,0 +1,260 @@
+关键词：DMA，DMA内存申请
+
+总线地址是从设备角度上看到的内存，物理地址是CPU的角度看到的未经过转换的内存（经过转换的是虚拟地址）
+
+ 
+ 
+DMA内存申请：不用kmalloc，它有它特定的内存申请模式
+解释一：
+		分为一致性内存申请和流式内存映射
+		一致性内存申请：dma_alloc_coherent(rx_dev->dev,AXI_XADC_BUFF_SIZE,&(axi_xadc_dev->dma_dsts),GFP_ATOMIC); 	
+		流式内存映射：	axi_xadc_dev->dma_dsts = dma_map_single(rx_dev->dev,axi_xadc_dev->dsts,AXI_XADC_BUFF_SIZE,DMA_DEV_TO_MEM); 	
+		一致性内存：设备和CPU能同时访问这块内存，无需担心cache的影响；	
+		流式内存：DMA必须释放内存之后，CPU才能访问这块内存
+解释二：
+		一致性DMA映射：书上讲的比较抽象，通俗地说就是任何对DMA缓冲区的改写都会直接更新到内存中，也称之为“同步的”或者“一致的”。
+		流式DMA映射：根据个人的理解，这里的流即输入输出流，我们需要事先指定DMA缓冲区的方向，比如是”读缓冲区”还是“写缓冲区”。也称之为“异步的”或“非一致性的”，详细的内容请看下文。
+
+		由于x86体系结构中，硬件设备驱动程序本身会“窥探”所访问的硬件告诉缓存，因此x86体系结构中不存在DMA一致性问题。
+		而对于其他一些架构如MIPS，SPARC以及POWERPC（包括ARM在内）需要在软件上保证其DMA一致性。
+		对于以上两者如何选择，书中有一个合适的建议，如果CPU和DMA处理器以不可预知的方式去访问一个缓冲区，那么必须强制使用一致性DMA映射方式（这里我对不可预知的理解是，不能确定在何时它们访问缓冲区）
+		其他情形下，流式DMA映射方式更可取，因为在一些体系结构中处理一致性DMA映射是很麻烦的，并且可能导致更低的系统性能。
+		
+解释三：因此在DMA是否使用cache的问题上，可以根据DMA缓冲区期望保留的的时间长短来决策。
+		一致性DMA映射申请的缓存区能够使用cache，并且保持cache一致性。一致性映射具有很长的生命周期，在这段时间内占用的映射寄存器，即使不使用也不会释放。生命周期为该驱动的生命周期		
+		流式DMA映射实现比较复杂，只知道种方式的生命周期比较短，而且禁用cache。一些硬件对流式映射有优化。建立流式DMA映射，需要告诉内核数据的流动方向。
+---------------------------------------------------------------------------------------
+Dma_alloc_writecombine函数详解：http://blog.csdn.net/beyondioi/article/details/6991575
+以下简略说明：
+①关于cache：  Cache：高速缓存，是位于CPU与主内存间的一种容量较小但速度很高的存储器。
+				Buffer：缓冲区，一个用于存储速度不同步的设备或优先级不同的设备之间传输数据的区域。通过缓冲区，可以使进程之间的相互等待变少，从而使从速度慢的设备读入数据时，速度快的设备的操作进程不发生间断。
+				buffer : 作为buffer cache的内存，是块设备的读写缓冲区
+　　			cache: 作为page cache的内存, 文件系统的cache
+					CPU在访问内存时，首先判断所要访问的内容是否在Cache中，如果在，就称为“命中（hit）”，此时CPU直接从Cache中调用该内容；
+					否则，就 称为“ 不命中”，CPU只好去内存中调用所需的子程序或指令了。
+					CPU不但可以直接从Cache中读出内容，也可以直接往其中写入内容。由于Cache的存取速率相当快，使得CPU的利用率大大提高，进而使整个系统的性能得以提升。
+					Cache的一致性就是直Cache中的数据，与对应的内存中的数据是一致的。
+			
+②关于一致性的问题：Cache的一致性就是Cache中的数据，与对应的内存中的数据是一致的。
+				DMA是直接操作总线地址的，这里先当作物理地址来看待吧（系统总线地址和物理地址只是观察内存的角度不同）。
+				如果cache缓存的内存区域不包括DMA分配到的区域，那么就没有一致性的问题。但是如果cache缓存包括了DMA目的地址的话，会出现什么什么问题呢？
+				问题出在，经过DMA操作，cache缓存对应的内存数据已经被修改了，而CPU本身不知道（DMA传输是不通过CPU的），它仍然认为cache中的数 据就是内存中的数据，
+				以后访问Cache映射的内存时，它仍然使用旧的Cache数据。这样就发生Cache与内存的数据“不一致性”错误。
+
+			
+③关于Dma_alloc_coherent和Dma_alloc_writecombine 的差别：首先两者都是一致性DMA映射！！！
+				两个函数都调用了__dma_alloc函数，区别只在于最后一个参数。
+				dma_alloc_coherent 在 arm 平台上会禁止页表项中的 C （Cacheable） 域以及 B (Bufferable)域。而 dma_alloc_writecombine 只禁止 C （Cacheable） 域.
+				C 代表是否使用高速缓冲存储器， 而 B 代表是否使用写缓冲区。
+				这样，dma_alloc_writecombine 分配出来的内存不使用缓存，但是会使用写缓冲区。而 dma_alloc_coherent  则二者都不使用。
+				
+④Dma_alloc_writecombine函数：
+				A = dma_alloc_writecombine(struct device *dev, size_t size ,dma_addr_t *handle, gfp_t gfp);
+				含义：
+				A     : 内存的虚拟起始地址，在内核要用此地址来操作所分配的内存
+				dev   : 可以平台初始化里指定，主要是用到dma_mask之类参数，可参考framebuffer
+				size  : 实际分配大小，传入dma_map_size即可
+				handle: 返回的内存物理地址，dma就可以用。
+----------------------------------------------------------------------------------------
+		
+代码分析：
+①：s3c_dma_ioctl代码分析，详见22th_dma\4th\dma.c
+
+#define BUF_SIZE  (512*1024)
+
+struct s3c_dma_regs {
+	unsigned long disrc;
+	unsigned long disrcc;
+	unsigned long didst;
+	unsigned long didstc;
+	unsigned long dcon;
+	unsigned long dstat;
+	unsigned long dcsrc;
+	unsigned long dcdst;
+	unsigned long dmasktrig;
+};
+
+static volatile struct s3c_dma_regs *dma_regs;
+
+static int s3c_dma_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg)
+{
+	int i;
+
+	memset(src, 0xAA, BUF_SIZE);
+	memset(dst, 0x55, BUF_SIZE);
+	
+	switch (cmd)
+	{
+		case MEM_CPY_NO_DMA :
+		{
+			for (i = 0; i < BUF_SIZE; i++)
+				dst[i] = src[i];
+			if (memcmp(src, dst, BUF_SIZE) == 0)
+			{
+				printk("MEM_CPY_NO_DMA OK\n");
+			}
+			else
+			{
+				printk("MEM_CPY_DMA ERROR\n");
+			}
+			break;
+		}
+
+		case MEM_CPY_DMA :
+		{
+			ev_dma = 0;
+			
+			/* 把源,目的,长度告诉DMA */
+			dma_regs->disrc      = src_phys;        /* 源的物理地址 */
+			dma_regs->disrcc     = (0<<1) | (0<<0); /* 源位于AHB总线, 源地址递增 */
+			dma_regs->didst      = dst_phys;        /* 目的的物理地址 */
+			dma_regs->didstc     = (0<<2) | (0<<1) | (0<<0); /* 目的位于AHB总线, 目的地址递增 */
+			dma_regs->dcon       = (1<<30)|(1<<29)|(0<<28)|(1<<27)|(0<<23)|(0<<20)|(BUF_SIZE<<0);  /* 使能中断,单个传输,软件触发, */
+
+			/* 启动DMA */
+			dma_regs->dmasktrig  = (1<<1) | (1<<0);
+
+			/* 如何知道DMA什么时候完成? */
+			/* 休眠 */
+			wait_event_interruptible(dma_waitq, ev_dma);
+
+			if (memcmp(src, dst, BUF_SIZE) == 0)
+			{
+				printk("MEM_CPY_DMA OK\n");
+			}
+			else
+			{
+				printk("MEM_CPY_DMA ERROR\n");
+			}
+			
+			break;
+		}
+	}
+
+	return 0;
+}
+	static struct file_operations dma_fops = {
+	.owner  = THIS_MODULE,
+	.ioctl  = s3c_dma_ioctl,
+};
+	分析：
+		①：BUF_SIZE已经进行定义，定义为512K，韦东山说1M的行不通，但是512K倒是可以
+		②：memcmp函数
+		int memcmp(const void *buf1, const void *buf2, unsigned int count);
+		memcmp是比较内存区域buf1和buf2的前count个字节。该函数是按字节比较的。
+		当buf1<buf2时，返回值小于0
+		当buf1==buf2时，返回值=0
+		当buf1>buf2时，返回值大于0
+			文中if (memcmp(src, dst, BUF_SIZE) == 0)即是对src和dst前BUF_SIZE即是512K字节进行比较，假如两者相等，则返回0，则这个判断语句成立
+		③：
+		
+		
+		
+	
+②s3c_dma_irq：dma简单中断程序
+static irqreturn_t s3c_dma_irq(int irq, void *devid)
+{
+	/* 唤醒 */
+	ev_dma = 1;
+    wake_up_interruptible(&dma_waitq);   /* 唤醒休眠的进程 */
+	return IRQ_HANDLED;
+}
+
+
+③s3c_dma_init：dma初始化程序
+static int s3c_dma_init(void)
+{
+	if (request_irq(IRQ_DMA3, s3c_dma_irq, 0, "s3c_dma", 1))
+	{
+		printk("can't request_irq for DMA\n");
+		return -EBUSY;
+	}
+	
+	/* 分配SRC, DST对应的缓冲区 */
+	src = dma_alloc_writecombine(NULL, BUF_SIZE, &src_phys, GFP_KERNEL);
+	if (NULL == src)
+	{
+		printk("can't alloc buffer for src\n");
+		free_irq(IRQ_DMA3, 1);
+		return -ENOMEM;
+	}
+	
+	dst = dma_alloc_writecombine(NULL, BUF_SIZE, &dst_phys, GFP_KERNEL);
+	if (NULL == dst)
+	{
+		free_irq(IRQ_DMA3, 1);
+		dma_free_writecombine(NULL, BUF_SIZE, src, src_phys);
+		printk("can't alloc buffer for dst\n");
+		return -ENOMEM;
+	}
+
+	major = register_chrdev(0, "s3c_dma", &dma_fops);
+
+	/* 为了自动创建设备节点 */
+	cls = class_create(THIS_MODULE, "s3c_dma");
+	class_device_create(cls, NULL, MKDEV(major, 0), NULL, "dma"); /* /dev/dma */
+
+	dma_regs = ioremap(DMA3_BASE_ADDR, sizeof(struct s3c_dma_regs));
+		
+	return 0;
+}
+	
+	分析：
+		①src = dma_alloc_writecombine(NULL, BUF_SIZE, &src_phys, GFP_KERNEL);
+			分配源
+			&src_phys 原型是  dma_addr_t *handle
+			handle: 返回的内存物理地址，dma就可以用。
+			dma_alloc_writecombine这个函数执行完之后，返回的物理地址将会保存在src之中
+				然后进行判断返回值，如果src返回是空的话，第一先释放内存：dma_free_writecombine(NULL, BUF_SIZE, src, src_phys);
+														 第二：	printk("can't alloc buffer for src\n");
+		②dst = dma_alloc_writecombine(NULL, BUF_SIZE, &dst_phys, GFP_KERNEL);		
+			分配目的
+			大体同上
+		③假如两者即是源和目的都可以进行分配，都没有出错，就进行字符设备的创建
+			cls = class_create(THIS_MODULE, "s3c_dma");
+			class_device_create(cls, NULL, MKDEV(major, 0), NULL, "dma"); /* /dev/dma */
+④：
+/*
+ * Allocate a writecombining region, in much the same way as
+ * dma_alloc_coherent above.
+ */
+void *
+dma_alloc_writecombine(struct device *dev, size_t size, dma_addr_t *handle, gfp_t gfp)
+{
+	return __dma_alloc(dev, size, handle, gfp,
+		pgprot_writecombine(pgprot_kernel));
+}
+⑤：
+/*
+ * Allocate DMA-coherent memory space and return both the kernel remapped
+ * virtual and bus address for that space.
+ */
+void *
+dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gfp_t gfp)
+{
+	if (arch_is_coherent()) {
+		void *virt;
+
+		virt = kmalloc(size, gfp);
+		if (!virt)
+			return NULL;
+		*handle =  virt_to_dma(dev, virt);
+
+		return virt;
+	}
+
+	return __dma_alloc(dev, size, handle, gfp,
+			   pgprot_noncached(pgprot_kernel));
+}
+
+
+
+
+
+
+
+
+
+
+
+

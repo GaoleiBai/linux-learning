@@ -1,0 +1,224 @@
+1、下载、建立source insight工程、编译、烧写、如果无运行分析原因
+tar xjf u-boot-2012.04.01.tar.bz2
+cd u-boot-2012.04.01
+make smdk2410_config
+make
+
+
+2. 分析u-boot: 通过链接命令分析组成文件、阅读代码分析启动过程
+
+a. 初始化硬件：关看门狗、设置时钟、设置SDRAM、初始化NAND FLASH
+b. 如果bootloader比较大，要把它重定位到SDRAM
+c. 把内核从NAND FLASH读到SDRAM
+d. 设置"要传给内核的参数"
+e. 跳转执行内核
+
+2.1 set the cpu to SVC32 mode
+2.2 turn off the watchdog
+2.3 mask all IRQs by setting all bits in the INTMR
+2.4 设置时钟比例
+2.5 设置内存控制器
+2.6 设置栈，调用C函数board_init_f
+	call_board_init_f:
+		ldr	sp, =(CONFIG_SYS_INIT_SP_ADDR)
+		bic	sp, sp, #7 /* 8-byte alignment for ABI compliance */
+		ldr	r0,=0x00000000
+		bl	board_init_f
+	分析：①想用C函数，必须先设置好栈！！
+		  ②问：如何得到栈的值CONFIG_SYS_INIT_SP_ADDR????
+		    答：在include\configs\Smdk2410.h中得到定义
+			  #define CONFIG_SYS_INIT_SP_ADDR	(CONFIG_SYS_SDRAM_BASE + 0x1000 - \GENERATED_GBL_DATA_SIZE)
+				得到CONFIG_SYS_SDRAM_BASE的宏PHYS_SDRAM_1的地址是：0x30000000; 
+				得到GENERATED_GBL_DATA_SIZE的方法：
+					在虚拟机下用arm-linux-objdump -D u-boot > u-boot.dis这条指令得到u-boot.dis反汇编文件
+					在反汇编文件下搜索call_board_init_f得到：
+						00000098 <call_board_init_f>:
+						98:	e59fd3d8 	ldr	sp, [pc, #984]	; 478 <fiq+0x58>
+						9c:	e3cdd007 	bic	sp, sp, #7	; 0x7
+						a0:	e3a00000 	mov	r0, #0	; 0x0
+						a4:	eb0007f1 	bl	2070 <board_init_f>
+					得知是去478地方取；	478:	30000f80 	.word	0x30000f80
+					故得SP = 0x30000f80;栈的地址故为此;
+		  ③#define DECLARE_GLOBAL_DATA_PTR     register volatile gd_t *gd asm ("r8")
+			分析：可以用这种格式定义为一个寄存器变量；
+				  意思就是假如去读*gd的值的话，实际上就是去读r8的值；
+				  在编译u-boot的时候 有：-ffixed-r8,固定的r8，即是编译的时候保留r8不变，将r8留给程序用，r8里面存有*gd 
+				  	gd = (gd_t *) ((CONFIG_SYS_INIT_SP_ADDR) & ~0x07);	CONFIG_SYS_INIT_SP_ADDR的地址就是0x30000f80；
+				  
+				  内存示意图：
+				  ----------------
+				  
+				
+				  ----------------
+				  gd_t结构体
+				  在此空间进行设置
+			  gd ----------------	SP:栈是往下生长的
+				  
+				   
+				  ----------------
+				  
+			
+2.7 调用函数数组init_sequence里的各个函数
+2.7.1 board_early_init_f : 设置系统时钟、设置GPIO
+......
+2.8 重定位代码:
+	 -pie, --pic-executable      Create a position independent executable
+	 分析：链接的时候加上PIE就会生成位置无关可执行程序
+2.8.1 从NOR FLASH把代码复制到SDRAM
+2.8.2 程序的链接地址是0，访问全局变量、静态变量、调用函数时是使"基于0地址编译得到的地址"
+      现在把程序复制到了SDRAM
+      需要修改代码，把"基于0地址编译得到的地址"改为新地址
+2.8.3 程序里有些地址在链接时不能确定，要到运行前才能确定：fixabs
+2.9 clear_bss
+2.10 调用C函数board_init_r：第2阶段的代码
+
+
+重定位分析：
+旧版的u-boot：
+	FALSH:	若是norflash，一上电程序从norflash开始运行，所以
+			若是nandflash，一上电前面4K的代码会被复制到片内4K的内存里面，从0地址开始执行，CPU从片内内存的0地址取值；
+	启动：	nand启动的时候0地址对应是片内内存，nor启动的时候0地址对应的是norflash
+	以上启动是程序比较小的时候执行;
+	当程序比较大的时候：从flash复制到SDRAM；复制到那个位置去呢？复制到链接地址去；	
+	①复制到链接地址：应该位于的地方；假如没有复制到链接地址会出错：例如访问某些全局变量会出错，因为访问全局变量用的是链接地址
+	②位置无关码:意思就是无论你把它扔到哪个位置，都可以进行
+		 故前面那段程序应该用位置无关码来写！
+新版的u-boot：
+	一样要把norflash的数据复制到SDRAM中，
+	①：复制到哪里？	
+		答：任选
+	②:	复制过去后，为何能执行？
+		答：除了把代码复制过去后，还要修改修改代码，改变里面的变量、函数，使用新地址；
+	③：假如我在norflash中所要访问的变量是0x100，当我把代码复制到SDRAM中的0x320000000的地址时，那么我想访问同一个变量，怎么办呢？
+		答：那就使用新地址，0x3200 0100来访问；
+		故需要加上PIE选项，会生成这些地址信息
+		假如没有加上PIE选项，是没有rel和dynsym这两个数据段的，从这些我们就可以知道要去修改哪一些地址
+			  *(.rel*)
+			  __rel_dyn_end = .;
+			 }
+			 .dynsym : {
+			  __dynsym_start = .;
+			  *(.dynsym)
+			 }
+			 
+ 	relocate_code(addr_sp, id, addr);
+	分析：	
+		addr_sp = addr - TOTAL_MALLOC_LEN;
+			addr = CONFIG_SYS_SDRAM_BASE + gd->ram_size;	//ram_size为64M	，故addr为0x3400 0000
+ 
+可以修改配置定义CONFIG_S3C2440
+
+---------------------------------------------------------------------------------------------------
+分析“重定位值修改代码为新地址”
+
+#ifndef CONFIG_SPL_BUILD
+	/*
+	 * fix .rel.dyn relocations
+	 */
+	ldr	r0, _TEXT_BASE		/* r0 <- Text base */
+	//r0=0，代码基地址
+	
+	sub	r9, r6, r0		/* r9 <- relocation offset */
+	//r9 = r6-r0;
+	//r6是目的地址，r0是零地址
+	//零地址到目的地址之间的偏移值
+	
+	ldr	r10, _dynsym_start_ofs	/* r10 <- sym table ofs */
+	//读内存指令，读动态符号表的偏移值（通过查看链接脚本和反汇编可以得到）
+	//具体分析：在Start.s找下来可得：
+					_dynsym_start_ofs:
+						.word __dynsym_start - _start
+				所以想要得到_dynsym_start_ofs我们就必须要知道.word __dynsym_start和_start
+				_dynsym_start_ofs这个值在链接脚本里面定义了，编译的时候会把它确定下来，搜索编译脚本u-boot.dis可得到：
+					 .dynsym : {
+					  __dynsym_start = .;
+					  *(.dynsym)
+					 }
+				所以__dynsym_start的值就是dynsym这一个数据段的起始地址那么__dynsym_start - _start就是该数据段起始地址减去文件的起始地址，也就是_dynsym_start_ofs
+				再在反汇编文件中u-boot.lds中搜索_dynsym_start_ofs可得：
+				000001a8 <_dynsym_start_ofs>:
+				1a8:	00073608 	.word	0x00073608
+				综上可得：_dynsym_start_ofs的值就是00073608！！
+										
+	add	r10, r10, r0		/* r10 <- sym table in FLASH */
+	//r10 = r10+r0。FLASH上面所有文件的动态符号表的地址，可以在反汇编文件进行搜索下； 
+	
+	ldr	r2, _rel_dyn_start_ofs	/* r2 <- rel dyn start ofs */
+	r2=0x0006b568
+	
+	add	r2, r2, r0		/* r2 <- rel dyn start in FLASH */
+	//r2=r2+r0=0006b568
+	//rel dyn这些信息在FLASH上的起始地址
+	
+	ldr	r3, _rel_dyn_end_ofs	/* r3 <- rel dyn end ofs */
+	//结束地址
+	
+	add	r3, r3, r0		/* r3 <- rel dyn end in FLASH */
+	//r3=r3+r0=00073608
+	//FLASH上面rel dyn这段信息的结束地址
+	
+//修改循环，修改地址，把原来地址修改为新地址	
+fixloop:
+	ldr	r0, [r2]		/* r0 <- location to fix up, IN FLASH! */
+	1.r0=[0006b568]=00000020
+	//去0006b568这个地址去读，读到00000020
+	
+	add	r0, r0, r9		/* r0 <- location to fix up in RAM */
+	1. r0=r0+r9= 00000020+33f41000 = 0x33f41020
+	
+	ldr	r1, [r2, #4]
+	1. r1=[0006b568+4]=00000017
+	
+	and	r7, r1, #0xff
+	1.r7=r1&0xff=0x00000017
+	
+	cmp	r7, #23			/* relative fixup? */
+	1.r7==23	//比较r7是否等于23，23十进制就是0x00000017
+	
+	beq	fixrel
+	//如果相等的话，跳转到fixrel
+	
+	cmp	r7, #2			/* absolute fixup? */
+	beq	fixabs
+	/* ignore unknown type of fixup */
+	b	fixnext
+fixabs:
+	/* absolute fix: set location to (offset) symbol value */
+	mov	r1, r1, LSR #4		/* r1 <- symbol index in .dynsym */
+	add	r1, r10, r1		/* r1 <- address of symbol in table */
+	ldr	r1, [r1, #4]		/* r1 <- symbol value */
+	add	r1, r1, r9		/* r1 <- relocated sym addr */
+	b	fixnext
+fixrel:
+	/* relative fix: increase location by offset */
+	ldr	r1, [r0]
+	1. r1=[00000020]=000001e0
+	
+	add	r1, r1, r9
+	1.r1=r1+r9=000001e0 + 33f41000 = 33f411e0
+	
+fixnext:
+	str	r1, [r0]
+	//r0新的地址等于r1
+	1.[0x33f41020] = 33F411E0
+	
+	add	r2, r2, #8		/* each rel.dyn entry is 8 bytes */
+	1. r2=r2+8=0006b568+8=6B570
+	
+	cmp	r2, r3
+	//比较r2和r3 如果没有相等的话，继续fixloop这个循环；
+	
+	blo	fixloop
+#endif
+
+-------------------------------------------------------------------------------------------------------------------
+
+
+  
+  
+  
+  
+  
+  
+  
+  
